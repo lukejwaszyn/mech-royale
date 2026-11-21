@@ -75,9 +75,14 @@ impl Bot {
     }
 
     /// Score of going to `pos` for `value`: value per second, or None if out of reach.
-    fn eval_task(&self, f: &Frame, obs: &Obs, pos: V3, value: f32, extra_s: f32, next_only: bool) -> Option<(f32, bool)> {
+    fn eval_task(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32, next_only: bool) -> Option<(f32, bool)> {
         let d = dist2d(pos, f.pos);
         if d > self.tune.loot_range || value <= 0.0 {
+            return None;
+        }
+        // not next to a mech we are not fighting
+        let fighting = if sit.fight { sit.target.map(|x| x.id) } else { None };
+        if d > 12.0 && sit.foes.iter().any(|x| x.age < 20.0 && Some(x.id) != fighting && dist2d(x.pos, pos) < self.tune.avoid_range * 0.9) {
             return None;
         }
         let me = &obs.me;
@@ -154,23 +159,23 @@ impl Bot {
             }
             let (gain, _) = self.pickup_gain(f, sit, weapon_bit(&p.kind));
             if gain > 0.5 {
-                offer(TaskKind::Pickup(p.id), p.pos, self.eval_task(f, obs, p.pos, gain, 0.5, next_only));
+                offer(TaskKind::Pickup(p.id), p.pos, self.eval_task(f, obs, sit, p.pos, gain, 0.5, next_only));
             }
         }
         if want_cubes {
             for c in &self.model.cubes {
-                offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, c.pos, tune.v_cube, 0.0, next_only));
+                offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, tune.v_cube, 0.0, next_only));
             }
         }
         if farm_ok {
             let special_full = f.slots.iter().all(|s| s.is_some());
             for c in &self.model.crates {
                 let v = tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
-                offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, c.pos, v, c.hp / gun_dps + 2.0, next_only));
+                offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0, next_only));
             }
             if want_cubes {
                 for tr in self.model.tracks.iter().filter(|x| x.npc && t - x.seen_t < 4.0) {
-                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, tr.pos, tune.v_npc, tr.hp / gun_dps + 3.0, next_only));
+                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, tune.v_npc, tr.hp / gun_dps + 3.0, next_only));
                 }
             }
         }
@@ -179,7 +184,7 @@ impl Bot {
             let contested = sit.foes.iter().any(|x| x.age < 5.0 && dist2d(x.pos, d.pos) < 60.0);
             let v = tune.v_drop * (1.0 + (1.0 - f.hp_frac)) * if contested { 0.3 } else { 1.0 };
             let wait = (d.lands_in - travel).max(0.0) + d.capture_s;
-            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, d.pos, v, wait, false));
+            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, sit, d.pos, v, wait, false));
         }
         if best.map(|b| b.kind) != self.task.map(|b| b.kind) {
             self.task_started = t;

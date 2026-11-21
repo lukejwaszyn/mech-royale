@@ -44,6 +44,24 @@ pub struct Track {
     /// Damage it dealt to us, decaying with a 3 s time constant.
     pub dmg_to_us: f32,
     pub we_hit_t: f32,
+    /// Duel record: all damage it dealt to us / we dealt to it, and the seconds it was
+    /// in the open in front of us. Their ratios measure how well each side shoots.
+    pub dmg_us_total: f32,
+    pub dmg_them_total: f32,
+    pub los_time: f32,
+}
+
+impl Track {
+    /// Its damage per second on us while it can see us (prior: a competent gunner,
+    /// more with a laser; the evidence takes over after a few seconds in the open).
+    pub fn their_dps(&self) -> f32 {
+        let prior = 85.0 + if self.weapons & W_LASER != 0 { 60.0 } else { 0.0 } + if self.weapons & W_LIGHTNING != 0 { 15.0 } else { 0.0 };
+        (self.dmg_us_total + prior * 3.0) / (self.los_time + 3.0)
+    }
+    /// Our damage per second on it while we can see it (prior 85).
+    pub fn our_dps(&self) -> f32 {
+        (self.dmg_them_total + 85.0 * 3.0) / (self.los_time + 3.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +154,7 @@ impl Model {
                             if let Some(tr) = self.tracks.iter_mut().find(|x| x.id == by) {
                                 tr.hit_us_t = t;
                                 tr.dmg_to_us += amount;
+                                tr.dmg_us_total += amount;
                             }
                         }
                     }
@@ -145,6 +164,7 @@ impl Model {
                     if let Some(id) = e.target {
                         if let Some(tr) = self.tracks.iter_mut().find(|x| x.id == id) {
                             tr.we_hit_t = t;
+                            tr.dmg_them_total += e.amount.unwrap_or(0.0);
                         }
                     }
                 }
@@ -245,6 +265,9 @@ impl Model {
                     tr.seen_t = t;
                     tr.in_obs = true;
                     tr.los = los;
+                    if los && dist(a.pos, me.pos) < 240.0 {
+                        tr.los_time += dt;
+                    }
                     if eye_los {
                         tr.los_t = t;
                     }
@@ -268,6 +291,9 @@ impl Model {
                     hit_us_t: -1e9,
                     dmg_to_us: 0.0,
                     we_hit_t: -1e9,
+                    dmg_us_total: 0.0,
+                    dmg_them_total: 0.0,
+                    los_time: 0.0,
                 }),
             }
         }

@@ -36,29 +36,45 @@ tuning! {
     /// HP fraction needed to start hunting a mech that is not attacking us.
     hunt_min_hp = 0.8,
     /// Do not walk further than this (straight line, m) to start a fight.
-    hunt_range = 230.0,
+    hunt_range = 170.0,
     /// Below this HP fraction: break line of sight and regenerate.
     retreat_hp = 0.42,
     /// Retreat threshold when two or more enemies are shooting at us.
-    retreat_hp_outnumbered = 0.78,
+    retreat_hp_outnumbered = 0.9,
     /// Engaged by more than this many enemies: retreat whatever our HP.
-    max_enemies = 2.0,
+    max_enemies = 1.0,
+    /// A target counts as alone when no other mech is within this distance of it (m).
+    isolation_radius = 85.0,
+    /// Duel estimate (our survival time / the target's): below this we break off even at
+    /// high HP, above `press_margin` we keep fighting even at low HP.
+    flee_margin = 0.7,
+    press_margin = 1.3,
+    /// Start a fight with a healthy mech only if our power (cubes, second weapon) is at
+    /// least this multiple of its power, or it has shown poor aim.
+    hunt_power_ratio = 1.15,
     /// Leave cover and fight again above this HP fraction.
     reengage_hp = 0.86,
     /// Keep fighting below `retreat_hp` while the only enemy has less than this x our HP.
     finish_ratio = 0.6,
+    /// A target below this HP fraction is chased down (boost, close range) before it regenerates.
+    finish_hp = 0.4,
+    /// Shot continuously for this long while retreating: stop running, fight the weakest.
+    last_stand_s = 2.5,
     /// Give up on a target we could not shoot for this long (s).
     target_patience_s = 14.0,
 
     // ---- ranges (m)
-    range_gun_min = 55.0,
-    range_gun_max = 105.0,
+    range_gun_min = 70.0,
+    range_gun_max = 120.0,
     /// With lightning (and energy) close to this distance.
     range_lightning = 28.0,
     /// Without lightning, stay at least this far from a lightning carrier.
     range_vs_lightning = 62.0,
     /// A mech known within this distance stops looting and farming.
     threat_range = 150.0,
+    /// Keep at least this far from mechs we are not fighting (they defend their space,
+    /// and a group is never worth walking into); loot inside this radius of them is ignored.
+    avoid_range = 100.0,
 
     // ---- movement
     /// Search radius (walking m) for cover when retreating.
@@ -172,13 +188,13 @@ impl Tuning {
         self.ffa = true;
         self.aggression = 0.35;
         self.hunt_min_hp = 0.9;
-        self.hunt_range = 120.0;
+        self.hunt_range = 130.0;
         self.retreat_hp = 0.55;
         self.retreat_hp_outnumbered = 0.9;
         self.max_enemies = 1.0;
         self.reengage_hp = 0.92;
-        self.range_gun_min = 75.0;
-        self.range_gun_max = 130.0;
+        self.range_gun_min = 80.0;
+        self.range_gun_max = 135.0;
     }
 
     /// Apply `key=value,key=value`; returns the entries that could not be applied.

@@ -152,18 +152,23 @@ pub struct Foe {
     /// It is shooting at us or aiming at us.
     pub engaged: bool,
     pub weapons: u8,
+    pub cubes: f32,
 }
 
 #[derive(Default)]
 pub struct Sit {
+    /// Duel estimate against the target: (seconds we last) / (seconds it lasts). > 1 = we win.
+    pub margin: f32,
     pub foes: Vec<Foe>,
     pub n_engaged: usize,
     pub target: Option<Foe>,
     /// The enemy to hide from / face.
     pub threat: Option<Foe>,
     pub threat_near: bool,
-    /// May we start shooting at mechs that are not attacking us?
-    pub free_fire: bool,
+    /// We have decided to fight `target` (it attacks us, or it is worth hunting).
+    pub fight: bool,
+    /// Enemies are around that we neither fight nor are attacked by: stay out of sight.
+    pub wary: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,6 +238,8 @@ pub struct Bot {
     fight_cover_t: f32,
     strafe_sign: f32,
     strafe_until: f32,
+    exposed_since: f32,
+    stand_until: f32,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -253,6 +260,7 @@ pub struct Bot {
     last_mode_log: f32,
     pub timing: Timing,
     pub debug: bool,
+    pub verbose: bool,
 }
 
 impl Bot {
@@ -308,6 +316,8 @@ impl Bot {
             fight_cover_t: -1e9,
             strafe_sign: 1.0,
             strafe_until: -1e9,
+            exposed_since: -1.0,
+            stand_until: -1e9,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -323,6 +333,7 @@ impl Bot {
             last_t: 0.0,
             last_mode_log: -1e9,
             timing: Timing::default(),
+            verbose: std::env::var("MECH_VERBOSE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
             debug: std::env::var("MECH_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
         }
     }
@@ -414,6 +425,15 @@ impl Bot {
         if ms > 20.0 {
             tm.over_20 += 1;
             eprintln!("[bot] slow decision {:.1} ms at t={:.1} mode={:?}", ms, obs.t, self.mode);
+        }
+        if self.verbose && (obs.t * 10.0).round() as i64 % 5 == 0 {
+            let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
+            let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
+            eprintln!(
+                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} retreat={} n={} dmg={:.0} {} [{}] rem={:.0}",
+                obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
+                self.retreating, sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining
+            );
         }
         if obs.t - self.last_mode_log >= 10.0 {
             self.last_mode_log = obs.t;
@@ -521,15 +541,12 @@ impl Bot {
             let age = t - tr.seen_t;
             let d = dist(tr.pos, f.pos);
             let to_us = (f.pos[1] - tr.pos[1]).atan2(f.pos[0] - tr.pos[0]);
-            let aiming = tr.in_obs && tr.los && d < 290.0 && ang_diff(tr.aim[0], to_us).abs() < 0.3;
+            let aiming = tr.in_obs && tr.los && d < 170.0 && ang_diff(tr.aim[0], to_us).abs() < 0.25;
             let engaged = age < 1.5 && (aiming || t - tr.hit_us_t < 3.0);
-            sit.foes.push(Foe { ti, id: tr.id, pos: tr.pos, dist: d, los: tr.los && age < 0.3, age, hp: tr.hp, hp_frac: if tr.max_hp > 0.0 { tr.hp / tr.max_hp } else { 1.0 }, engaged, weapons: tr.weapons });
+            sit.foes.push(Foe { ti, id: tr.id, pos: tr.pos, dist: d, los: tr.los && age < 0.3, age, hp: tr.hp, hp_frac: if tr.max_hp > 0.0 { tr.hp / tr.max_hp } else { 1.0 }, engaged, weapons: tr.weapons, cubes: tr.cubes });
         }
         sit.n_engaged = sit.foes.iter().filter(|x| x.engaged).count();
-        sit.threat_near = sit.foes.iter().any(|x| x.age < 8.0 && x.dist < tune.threat_range);
-        // In practice every other mech is a house bot hunting us: shoot on sight. In a
-        // free-for-all only shoot what attacks us or is already weak.
-        sit.free_fire = !tune.ffa;
+        sit.threat_near = sit.foes.iter().any(|x| x.age < 8.0 && x.dist < tune.threat_range && (x.los || x.engaged || x.dist < tune.avoid_range));
 
         // ---- target
         let mut best: Option<(f32, Foe)> = None;
@@ -540,12 +557,15 @@ impl Bot {
             if tune.ffa && !foe.engaged && foe.hp_frac > 0.5 {
                 continue;
             }
-            let mut s = 2.0 * (1.0 - foe.hp_frac) - foe.dist / 120.0 - 0.3 * foe.age;
+            let mut s = 4.0 * (1.0 - foe.hp_frac) - foe.dist / 120.0 - 0.3 * foe.age;
+            if foe.hp_frac < tune.finish_hp {
+                s += 2.0;
+            }
             if foe.los {
                 s += 1.5;
             }
             if foe.engaged {
-                s += 1.2;
+                s += 2.5;
             }
             if self.target == Some(foe.id) {
                 s += 0.8;
@@ -569,6 +589,48 @@ impl Bot {
         }
         sit.target = target;
 
+        // ---- duel estimate: how long do we last under everyone shooting at us, against
+        // how long the target lasts under our fire (measured accuracy of both sides).
+        let incoming: f32 = sit.foes.iter().filter(|x| x.engaged || Some(x.id) == target.map(|g| g.id)).map(|x| self.model.tracks[x.ti].their_dps()).sum();
+        sit.margin = match target {
+            Some(tg) => {
+                let ours = self.model.tracks[tg.ti].our_dps();
+                let ttd = obs.me.hp / incoming.max(5.0);
+                let mut ttk = tg.hp.max(1.0) / ours.max(5.0);
+                if let Some((_, g)) = f.slot(W_GUN) {
+                    // the magazine will not finish it: the reload is dead time
+                    if f.slots.iter().flatten().count() == 1 && g.ammo * g.stats.damage * 0.8 < tg.hp {
+                        ttk += 0.6 * g.stats.reload;
+                    }
+                }
+                ttd / ttk
+            }
+            None => 9.0,
+        };
+
+        // ---- fight it? Always when it attacks us. Otherwise only a fight we can keep
+        // one-on-one and expect to win: it stands alone, we see it, and either it is
+        // already weak or we are clearly the stronger mech (cubes, second weapon, or it
+        // has shown that it cannot shoot). The squad sends its weakest first, so a mech
+        // that is not hunting us is likely a better one: leave it alone.
+        if let Some(tg) = target {
+            let tr = &self.model.tracks[tg.ti];
+            let isolated = !sit.foes.iter().any(|x| x.id != tg.id && x.age < 10.0 && dist(x.pos, tg.pos) < tune.isolation_radius);
+            let weak = tg.hp_frac < tune.finish_hp;
+            let special = |w: u8| if w & !W_GUN != 0 { 0.35 } else { 0.0 } + if w & W_LASER != 0 { 0.15 } else { 0.0 };
+            let mine = f.slots.iter().flatten().fold(0u8, |a, s| a | s.bit);
+            let my_power = 1.0 + 0.08 * obs.me.cubes.min(tune.max_cubes) + special(mine);
+            let its_power = 1.0 + 0.08 * tg.cubes.min(10.0) + special(tg.weapons);
+            let proven_poor = tr.los_time > 5.0 && tr.their_dps() < 45.0;
+            let stronger = my_power >= its_power * tune.hunt_power_ratio || proven_poor;
+            let hunt = tune.aggression > 0.0
+                && isolated
+                && tg.dist <= tune.hunt_range * tune.aggression.clamp(0.3, 1.0)
+                && ((weak && f.hp_frac >= tune.retreat_hp + 0.1) || (stronger && tg.los && f.hp_frac >= tune.hunt_min_hp && !tune.ffa));
+            sit.fight = tg.engaged || hunt;
+        }
+        sit.wary = !sit.fight && sit.foes.iter().any(|x| x.age < 10.0 && x.dist < tune.avoid_range);
+
         // ---- whom to hide from / face: whoever hurts us most, else the nearest shooter, else the target
         sit.threat = sit
             .foes
@@ -586,12 +648,36 @@ impl Bot {
         // ---- fight or flight
         let hp = f.hp_frac;
         let n = sit.n_engaged;
-        let finishing = n <= 1 && target.map_or(false, |tg| tg.los && tg.hp < tune.finish_ratio * obs.me.hp);
+        let finishing = target.map_or(false, |tg| {
+            (n <= 1 && tg.los && tg.hp < tune.finish_ratio * obs.me.hp) || (n <= 2 && tg.age < 1.0 && tg.hp_frac < tune.finish_hp * 0.7 && tg.dist < 80.0 && hp > 0.45)
+        });
+        // Retreating but still being shot for seconds: the cover is not working. Turn and
+        // take the weakest one with us - in the practice run a kill is a point.
+        if self.retreating && self.model.dmg_recent > 120.0 && t - self.model.last_hurt_t < 0.5 {
+            if self.exposed_since < 0.0 {
+                self.exposed_since = t;
+            }
+        } else if t - self.model.last_hurt_t > 1.0 {
+            self.exposed_since = -1.0;
+        }
+        if self.retreating && self.exposed_since >= 0.0 && t - self.exposed_since > tune.last_stand_s {
+            self.stand_until = t + 5.0;
+            self.exposed_since = -1.0;
+        }
+        let stand = t < self.stand_until && target.is_some();
         let danger_near = sit.foes.iter().any(|x| x.age < 6.0 && x.dist < 280.0);
-        let want = danger_near && ((hp < tune.retreat_hp && !finishing) || (n >= 2 && hp < tune.retreat_hp_outnumbered) || n as f32 > tune.max_enemies);
-        if self.retreating {
+        let winning = sit.margin > tune.press_margin;
+        let losing = sit.margin < tune.flee_margin && n >= 1;
+        let outnumbered = n as f32 > tune.max_enemies && sit.margin < 2.0 * tune.press_margin;
+        let want = danger_near && !finishing && (losing || (hp < tune.retreat_hp && !winning) || (n >= 2 && hp < tune.retreat_hp_outnumbered && !winning) || outnumbered);
+        if stand {
+            self.retreating = false;
+            sit.fight = true;
+        } else if self.retreating {
             let calm = !sit.foes.iter().any(|x| x.age < 6.0 && x.dist < tune.threat_range);
-            if (hp >= tune.reengage_hp && (n as f32) <= tune.max_enemies) || (calm && n == 0) || finishing {
+            // back to the fight when healed, when nobody is left, or when the numbers say we
+            // win anyway (an enemy that cannot shoot is not a reason to hide)
+            if (hp >= tune.reengage_hp && (n as f32) <= tune.max_enemies) || (calm && n == 0) || finishing || (winning && !outnumbered && sit.margin > 1.2 * tune.press_margin) {
                 self.retreating = false;
                 self.cover = None;
             }
@@ -606,21 +692,25 @@ impl Bot {
     /// Range band (min, max) we want to the target.
     fn range_band(&self, f: &Frame, obs: &Obs, foe: &Foe) -> (f32, f32) {
         let tune = &self.tune;
-        if let Some((_, s)) = f.slot(W_LIGHTNING) {
-            if obs.me.energy > 25.0 {
-                return (10.0, tune.range_lightning.min(s.stats.range * 0.8));
-            }
+        let finish = foe.hp_frac < tune.finish_hp && f.hp_frac > 0.35;
+        let they_arc = foe.weapons & W_LIGHTNING != 0;
+        let we_arc = f.slot(W_LIGHTNING).map_or(false, |(_, s)| obs.me.energy > 25.0 && s.stats.range > 0.0);
+        // Lightning never misses inside its range, whoever pilots it: stay well outside
+        // an enemy's arc unless we carry one too and have the HP to win the brawl.
+        let arc_safe = tune.range_vs_lightning.max(self.cfg.weapons.get("lightning").range * 1.35);
+        if we_arc && (!they_arc || obs.me.hp > foe.hp * 1.15) {
+            let r = f.slot(W_LIGHTNING).map_or(45.0, |(_, s)| s.stats.range);
+            return (10.0, tune.range_lightning.min(r * 0.8));
         }
-        let (mut lo, mut hi) = (tune.range_gun_min, tune.range_gun_max);
-        if foe.weapons & W_LIGHTNING != 0 {
-            lo = lo.max(tune.range_vs_lightning);
-            hi = hi.max(lo + 40.0);
+        if they_arc {
+            let lo = tune.range_gun_min.max(arc_safe);
+            return if finish { (lo, lo + 20.0) } else { (lo, tune.range_gun_max.max(lo + 45.0)) };
         }
-        if foe.hp_frac < 0.3 {
-            // finish it: stay close enough that it cannot break away
-            hi = hi.min(lo + 20.0);
+        if finish {
+            // finish it: get close enough that it cannot break away and regenerate
+            return (12.0, 40.0);
         }
-        (lo, hi)
+        (tune.range_gun_min, tune.range_gun_max)
     }
 
     // ------------------------------------------------------------------ movement intent
@@ -673,16 +763,26 @@ impl Bot {
         // 3. Retreat: break line of sight and regenerate.
         if self.retreating {
             if let Some(th) = sit.threat {
-                return self.plan_retreat(f, obs, sit, th);
+                return self.plan_retreat(f, obs, sit, th, true);
             }
         }
 
         // 4. Fight.
         if let Some(tg) = sit.target {
-            let hunt_ok = self.tune.aggression > 0.0 && f.hp_frac >= self.tune.hunt_min_hp && tg.dist <= self.tune.hunt_range * self.tune.aggression.max(0.3);
-            let committed = tg.engaged || tg.los && tg.dist < self.tune.range_gun_max * 1.3 && sit.free_fire || tg.hp_frac < 0.5 && tg.dist < self.tune.hunt_range;
-            if (tg.engaged || hunt_ok || committed) && z.inside_at([tg.pos[0], tg.pos[1]], f.t + 6.0, -30.0) {
+            if sit.fight && (tg.engaged || z.inside_at([tg.pos[0], tg.pos[1]], f.t + 6.0, -30.0)) {
                 return self.plan_fight(f, obs, sit, tg);
+            }
+        }
+
+        // 4b. Enemies about that we do not want to fight (a group, or we are not healthy):
+        //     get out of their sight and let whoever hunts us come round the corner alone.
+        if sit.wary && need == 0 {
+            let near = sit.foes.iter().filter(|x| x.age < 10.0).min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)).copied();
+            if let Some(th) = near {
+                let mut it = self.plan_retreat(f, obs, sit, th, false);
+                it.mode = Mode::Hold;
+                it.boost = it.boost && th.dist < 70.0;
+                return it;
             }
         }
 
@@ -697,7 +797,7 @@ impl Bot {
         //    a spot near a wall inside the next circle.
         let weak = f.slots.iter().any(|s| s.is_none()) || me.cubes < self.tune.explore_until_cubes;
         let mut goal = home;
-        if need == 0 && weak && f.hp_frac >= self.tune.farm_min_hp && !sit.threat_near && self.tune.explore_until_cubes >= 0.0 {
+        if need == 0 && weak && f.hp_frac >= self.tune.farm_min_hp && !sit.wary && self.tune.explore_until_cubes >= 0.0 {
             let stale = self.explore.map_or(true, |(g, since)| dist2d(g, f.pos) < 6.0 || f.t - since > 25.0 || !z.inside_next([g[0], g[1]], 4.0));
             if stale {
                 let nav = &self.navs[f.nav_idx].1;
@@ -708,6 +808,9 @@ impl Bot {
                     if let Some(p) = nav.nearest_walkable(z.nc[0] + r * a.cos(), z.nc[1] + r * a.sin()) {
                         let d = dist2d(p, f.pos);
                         if !(40.0..=260.0).contains(&d) || !z.inside_next([p[0], p[1]], 6.0) {
+                            continue;
+                        }
+                        if sit.foes.iter().any(|x| x.age < 25.0 && dist2d(x.pos, p) < self.tune.avoid_range) {
                             continue;
                         }
                         // prefer ground we have not walked yet, and not too far
@@ -735,7 +838,8 @@ impl Bot {
         it
     }
 
-    fn plan_retreat(&mut self, f: &Frame, obs: &Obs, sit: &Sit, th: Foe) -> Intent {
+    /// Get out of `th`'s sight (and stay out). `allow_stand`: turn and fight when cornered.
+    fn plan_retreat(&mut self, f: &Frame, obs: &Obs, sit: &Sit, th: Foe, allow_stand: bool) -> Intent {
         let me = &obs.me;
         let t = f.t;
         let h = f.body.height;
@@ -791,7 +895,7 @@ impl Bot {
         let strafe_axis = perp(norm2([th.pos[0] - f.xy[0], th.pos[1] - f.xy[1]]));
         // Cornered: a close enemy with a clear shot and no cover right here. Running at the
         // same speed never breaks its line of sight; shooting back is the better trade.
-        let cornered = exposed && th.dist < 45.0;
+        let cornered = allow_stand && exposed && th.dist < 45.0;
         match self.cover {
             Some(c) => {
                 let d = self.drive_to(f, obs, c, 1.0, false);
@@ -868,7 +972,7 @@ impl Bot {
             }
         }
 
-        let chase = tg.hp_frac < 0.35 && tg.dist > rmax && me.energy > 40.0;
+        let chase = tg.hp_frac < self.tune.finish_hp && f.hp_frac > 0.35 && (tg.dist > rmax || !tg.los) && me.energy > 12.0;
         let close_in = has_lightning && tg.dist > rmax + 25.0 && me.energy > 60.0;
         if !tg.los {
             // Close in on where it is until we have a line of fire.
@@ -890,7 +994,13 @@ impl Bot {
         let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
         it.strafe = Some((side, sw));
         if tg.dist < rmin {
-            it.away = Some(([-bearing[0], -bearing[1]], 0.9));
+            // kite: back off at full speed (the torso keeps facing and firing), harder the
+            // deeper it is inside our minimum range
+            let deep = tg.dist < rmin * 0.8;
+            it.away = Some(([-bearing[0], -bearing[1]], if deep { 2.2 } else { 1.4 }));
+            it.strafe = Some((side, if deep { 0.4 * sw } else { 0.7 * sw }));
+            it.boost = deep && tg.weapons & W_LIGHTNING != 0 && me.energy > 10.0;
+            it.no_charge = deep;
         } else if has_lightning {
             // keep pressing inside arc range
             it.away = Some((bearing, 0.3));

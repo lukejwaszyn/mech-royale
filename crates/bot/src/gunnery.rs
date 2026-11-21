@@ -107,7 +107,9 @@ impl Bot {
         let mut fire = [false, false];
 
         // ---- pick what to shoot
-        let may_shoot = |foe: &Foe| sit.free_fire || foe.engaged || foe.hp_frac < 0.5 || Some(foe.id) == sit.target.map(|x| x.id);
+        // Mechs that attack us, and the one we decided to fight. Nobody else: a shot at a
+        // bystander makes one more enemy.
+        let may_shoot = |foe: &Foe| foe.engaged || (sit.fight && Some(foe.id) == sit.target.map(|x| x.id));
         let mut tgt: Option<Tgt> = None;
         if let Some(tg) = sit.target {
             if tg.age < 0.3 && may_shoot(&tg) {
@@ -233,9 +235,11 @@ impl Bot {
         // ---- reload discipline: at once when empty; early only when nobody can shoot us
         if let Some((_, s)) = f.slot(W_GUN) {
             if s.reload <= 0.0 && s.ammo < s.stats.mag {
-                let fresh_foe = sit.foes.iter().any(|x| x.age < 2.0 && (x.los || x.dist < 80.0));
+                let fresh_foe = sit.foes.iter().any(|x| x.age < 3.0 && (x.los || x.dist < 150.0));
                 let quiet = self.model.quiet_for() > 2.5;
-                if s.ammo <= 0.0 || (!gun_busy && !fresh_foe && (s.ammo <= s.stats.mag * 0.5 || quiet)) {
+                // with an enemy about, only top up a nearly empty magazine while it cannot see us
+                let top_up = !gun_busy && fresh_foe && s.ammo <= s.stats.mag * 0.25 && !sit.foes.iter().any(|x| x.los);
+                if s.ammo <= 0.0 || top_up || (!gun_busy && !fresh_foe && (s.ammo <= s.stats.mag * 0.5 || quiet)) {
                     reload = true;
                 }
             }
