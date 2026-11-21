@@ -311,6 +311,8 @@ pub struct Bot {
     hunt_until: (i64, f32),
     /// Hysteresis for keeping clear of mechs we are not fighting.
     wary_on: bool,
+    /// Walking into the zone, until properly inside.
+    zone_run: bool,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -407,6 +409,7 @@ impl Bot {
             shot_at: None,
             hunt_until: (-1, -1e9),
             wary_on: false,
+            zone_run: false,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -513,6 +516,7 @@ impl Bot {
                 eprintln!("[laser] t={:.0} {:?} task={:?}{}", obs.t, intent.mode, self.task.map(|k| k.kind), why);
             }
         }
+        let need_dbg = if self.verbose { self.zone_need(&f, obs) } else { 0 };
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         let tm = &mut self.timing;
         tm.n += 1;
@@ -529,9 +533,10 @@ impl Bot {
             let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
             let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
             eprintln!(
-                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} retreat={} n={} dmg={:.0} {} [{}] rem={:.0} task={}",
+                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} task={}",
                 obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
-                self.retreating, sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining,
+                obs.me.in_zone, need_dbg, f.zone.r - (f.xy[0] - f.zone.c[0]).hypot(f.xy[1] - f.zone.c[1]), f.zone.nr - (f.xy[0] - f.zone.nc[0]).hypot(f.xy[1] - f.zone.nc[1]), f.zone.t1,
+                sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining,
                 self.task.map(|k| format!("{:?}@({:.0},{:.0},{:.0}) s={:.2}", k.kind, k.pos[0], k.pos[1], k.pos[2], k.score)).unwrap_or_default()
             );
         }
@@ -968,8 +973,12 @@ impl Bot {
         }
 
         // 2. Zone discipline.
+        // Once on the way in, keep going until we are properly inside: a fight at the
+        // edge otherwise drags us out again and again (kiting, strafing), and the zone
+        // does the enemy's work.
         let need = self.zone_need(f, obs);
-        if need == 2 {
+        self.zone_run = need == 2 || (self.zone_run && need == 1);
+        if self.zone_run {
             let nav = &self.navs[f.nav_idx].1;
             let step = self.safe_field.as_ref().and_then(|fl| nav.field_next(fl, f.pos, 40.0));
             let d = match step {
@@ -1433,10 +1442,13 @@ impl Bot {
                     if world.walk_clear(f.pos, probe, &f.slim, 3.0).is_none() {
                         s -= 2.5;
                     }
-                    // do not dodge out of the zone
-                    let ahead = [f.xy[0] + c[0] * 12.0, f.xy[1] + c[1] * 12.0];
-                    if !f.zone.inside_at(ahead, t + 2.0, 4.0) {
-                        s -= 3.0;
+                    // do not dodge, kite or strafe out of the zone - nor to where the
+                    // closing circle will have passed in a few seconds
+                    let ahead = [f.xy[0] + c[0] * 14.0, f.xy[1] + c[1] * 14.0];
+                    if !f.zone.inside_at(ahead, t + 1.5, 4.0) {
+                        s -= 4.0;
+                    } else if !f.zone.inside_at(ahead, t + 6.0, 10.0) {
+                        s -= 2.0;
                     }
                 }
                 if has_threats {
