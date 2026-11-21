@@ -1,0 +1,19 @@
+[package]
+name = "bot"
+edition.workspace = true
+version.workspace = true
+description = "Mech Royale bot: the submitted binary"
+license = "MIT"
+
+[lib]
+name = "bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bot"
+path = "src/main.rs"
+
+[dependencies]
+world = { path = "../world" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,6 @@
+target
+.git
+arena
+crates/sim
+**/*.png
+**/*.ppm
