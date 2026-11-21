@@ -307,7 +307,10 @@ impl Bot {
             return None;
         }
         // Worth interrupting the gun for? Slow or close targets, or ones we cannot hit otherwise.
-        let likely = speed_s <= tune.mortar_max_target_speed || shot.time <= tune.mortar_max_flight_s;
+        // ... or it has been walking a steady line (a hunter coming straight at us) and
+        // the shell is not in the air too long for that to hold.
+        let steady = (tg.vel[0] - tg.vel_s[0]).hypot(tg.vel[1] - tg.vel_s[1]) < 2.0 && shot.time <= tune.mortar_steady_flight_s;
+        let likely = speed_s <= tune.mortar_max_target_speed || shot.time <= tune.mortar_max_flight_s || steady;
         if (gun_busy || tg.los) && !likely {
             return None;
         }

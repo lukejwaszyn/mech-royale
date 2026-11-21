@@ -130,6 +130,8 @@ tuning! {
     mortar_max_target_speed = 5.0,
     /// ... or the shell flies less than this (s).
     mortar_max_flight_s = 1.1,
+    /// ... or it moves in a steady line and the shell flies less than this (s; 0 = off).
+    mortar_steady_flight_s = 3.0,
     /// Keep this much energy when firing lightning (unless the target is nearly dead).
     lightning_reserve = 8.0,
     scan_period_s = 4.0,
@@ -142,6 +144,10 @@ tuning! {
     v_crate = 5.0,
     v_npc = 6.5,
     v_drop = 24.0,
+    /// Upgrade choice: added to the table weight of the laser damage / charge upgrades and
+    /// of the gun upgrades (the table puts max HP and armor first).
+    up_laser = 0.0,
+    up_gun = 0.0,
     /// Only consider loot within this straight-line distance (m).
     loot_range = 170.0,
     /// ... but a laser, while we hold none, within this distance, keeping only this far

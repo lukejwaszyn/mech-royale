@@ -1634,6 +1634,11 @@ impl Bot {
         let mut best = (f32::NEG_INFINITY, 0u32);
         for (i, c) in offer.choices.iter().enumerate() {
             let mut w = crate::config::upgrade_weight(&c.id);
+            if c.id.starts_with("laser_") && c.id != "laser_pierce" {
+                w += self.tune.up_laser;
+            } else if c.id.starts_with("gun_") {
+                w += self.tune.up_gun;
+            }
             // weapon upgrades only count for a weapon we hold
             if let Some(def) = self.cfg.upgrades.iter().find(|u| u.id == c.id) {
                 if let Some(req) = &def.requires {
