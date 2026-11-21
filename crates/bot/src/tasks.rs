@@ -222,15 +222,18 @@ impl Bot {
                 offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, tune.v_cube, 0.0));
             }
         }
+        // No laser and none known: looking for one may be worth more than farming.
+        let searching = !f.has(W_LASER) && !self.model.pickups.iter().any(|p| p.kind == "laser");
+        let farm_mult = if searching { tune.nolaser_farm_mult } else { 1.0 };
         if farm_ok {
             let special_full = f.slots.iter().all(|s| s.is_some());
             for c in &self.model.crates {
-                let v = tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
+                let v = farm_mult * tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
                 offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0));
             }
             if want_cubes {
                 for tr in self.model.tracks.iter().filter(|x| x.npc && t - x.seen_t < 4.0) {
-                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, tune.v_npc, tr.hp / gun_dps + 3.0));
+                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, farm_mult * tune.v_npc, tr.hp / gun_dps + 3.0));
                 }
             }
         }

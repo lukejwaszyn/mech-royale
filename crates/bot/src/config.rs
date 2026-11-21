@@ -148,6 +148,9 @@ tuning! {
     /// of the gun upgrades (the table puts max HP and armor first).
     up_laser = 0.0,
     up_gun = 0.0,
+    /// While we hold no laser and know of none: crates and drones are worth this much of
+    /// their value (below 1 the bot explores sooner).
+    nolaser_farm_mult = 1.0,
     /// Only consider loot within this straight-line distance (m).
     loot_range = 170.0,
     /// ... but a laser, while we hold none, within this distance, keeping only this far
