@@ -1,0 +1,12 @@
+[package]
+name = "world"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "navdump"
+path = "src/bin/navdump.rs"
