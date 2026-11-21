@@ -51,6 +51,10 @@ pub struct RunOpts {
     pub replay: Option<PathBuf>,
     pub trace: Option<PathBuf>,
     pub trace_scale: f32,
+    /// Crop the trace image to the path and zoom in.
+    pub trace_crop: bool,
+    /// Write a replay frame every this many decisions.
+    pub replay_every: u32,
     pub levels: [LevelParams; 4],
     pub squad_late_t: f32,
     pub squad_late_alive: usize,
@@ -73,6 +77,8 @@ impl Default for RunOpts {
             replay: None,
             trace: None,
             trace_scale: 1.0,
+            trace_crop: false,
+            replay_every: 5,
             levels: default_levels(),
             squad_late_t: 240.0,
             squad_late_alive: 6,
@@ -298,7 +304,7 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             }
         }
         if let Some(w) = replay.as_mut() {
-            if tick % cfg.replay_frame_every.max(1) == 0 {
+            if (tick / cfg.match_.decide_every.max(1)) % opts.replay_every.max(1) == 0 {
                 let _ = writeln!(w, "{}", sim.frame());
             }
             while log_pos < sim.log.len() {
@@ -340,7 +346,7 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
     }
     if let (Some(tr), Some(path)) = (trace.as_mut(), opts.trace.as_ref()) {
         tr.finish(&sim);
-        crate::render::render(&env.world, tr, opts.trace_scale, path).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::render::render(&env.world, tr, opts.trace_scale, opts.trace_crop, path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let mut bots: Vec<BotResult> = Vec::with_capacity(n);
     for b in 0..n {
@@ -369,8 +375,8 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             log_pos += 1;
         }
         let res: Vec<_> = bots.iter().map(|b| json!({"slot": b.slot, "name": b.name, "place": b.place, "kills": b.kills,
-            "died_t": b.death.as_ref().map(|d| d.t), "cause": b.death.as_ref().map(|d| d.cause), "by": b.death.as_ref().and_then(|d| d.by)})).collect();
-        let _ = writeln!(w, "{}", json!({"type":"result","t": sim.t, "complete": complete, "bots": res}));
+            "died_t": b.death.as_ref().map(|d| crate::util::r2(d.t)), "cause": b.death.as_ref().map(|d| d.cause), "by": b.death.as_ref().and_then(|d| d.by)})).collect();
+        let _ = writeln!(w, "{}", json!({"type":"result","t": crate::util::r2(sim.t), "complete": complete, "bots": res}));
         let _ = w.flush();
     }
     Ok(MatchResult { seed, bots, t_end: sim.t, wall_s: started.elapsed().as_secs_f64() })

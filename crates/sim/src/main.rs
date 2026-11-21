@@ -42,9 +42,11 @@ PROTOCOL / TIMING
   --bot-stderr         show the bots' stderr
 
 OUTPUT
-  --replay FILE.jsonl  dump a replay (one frame per decision); with several matches the seed is appended
+  --replay FILE.jsonl  dump a replay; with several matches the seed is appended to the file name
+  --replay-every N     one replay frame every N decisions (default 5 = 0.5 s; 1 = every decision, ~10 MB/match)
   --trace FILE.png     top-down image of the focus bot's path (.png or .ppm); seed appended likewise
   --trace-scale PX     pixels per metre (default 1)
+  --trace-crop         crop the image to the path and zoom in
   --all                print every bot's result per match, not only the focus bot
   --quiet              only the summary
 
@@ -151,6 +153,8 @@ fn main() {
             "--replay" => replay = Some(PathBuf::from(next(&mut i, a))),
             "--trace" => trace = Some(PathBuf::from(next(&mut i, a))),
             "--trace-scale" => opts.trace_scale = num(&next(&mut i, a), a),
+            "--trace-crop" => opts.trace_crop = true,
+            "--replay-every" => opts.replay_every = num(&next(&mut i, a), a),
             "--all" => all = true,
             "--quiet" | "-q" => quiet = true,
             "--arena" => arena = PathBuf::from(next(&mut i, a)),
@@ -286,10 +290,10 @@ fn main() {
         BotSpec::Idle => "idle".into(),
     };
     println!(
-        "summary: {} match(es), focus bot [{}] vs fill={}: mean(16-place) = {:.2}, mean kills {:.2}, mean survival {:.0}s; causes: {}",
+        "summary: {} match(es), focus bot [{}] vs {}: mean(16-place) = {:.2}, mean kills {:.2}, mean survival {:.0}s; causes: {}",
         done,
         fname,
-        fill,
+        if procs.len() >= n { "process bots only".to_string() } else { format!("fill={fill}") },
         pts_sum / done.max(1) as f64,
         kills_sum / done.max(1) as f64,
         surv_sum / done.max(1) as f64,

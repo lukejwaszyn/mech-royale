@@ -40,10 +40,10 @@ pub const LEVEL_NAMES: [&str; 4] = ["easy", "medium", "hard", "expert"];
 
 pub fn default_levels() -> [LevelParams; 4] {
     [
-        LevelParams { name: "easy", aim_sigma_deg: 6.0, react_s: 1.0, lead: 0.0, fire_tol_deg: 5.0, strafe: 0.0, retreat_hp: 0.0, loot: 0.3, boost: 0.0, drops: 0.0, face_threat: 0.0, defend_range: 50.0, gun_range: 60.0 },
-        LevelParams { name: "medium", aim_sigma_deg: 3.0, react_s: 0.6, lead: 0.6, fire_tol_deg: 3.0, strafe: 0.5, retreat_hp: 0.2, loot: 0.6, boost: 0.0, drops: 0.0, face_threat: 1.0, defend_range: 70.0, gun_range: 75.0 },
-        LevelParams { name: "hard", aim_sigma_deg: 1.5, react_s: 0.35, lead: 0.9, fire_tol_deg: 2.0, strafe: 1.0, retreat_hp: 0.3, loot: 0.9, boost: 1.0, drops: 1.0, face_threat: 1.0, defend_range: 90.0, gun_range: 85.0 },
-        LevelParams { name: "expert", aim_sigma_deg: 0.7, react_s: 0.2, lead: 1.0, fire_tol_deg: 1.2, strafe: 1.0, retreat_hp: 0.35, loot: 1.0, boost: 1.0, drops: 1.0, face_threat: 1.0, defend_range: 110.0, gun_range: 95.0 },
+        LevelParams { name: "easy", aim_sigma_deg: 6.0, react_s: 1.0, lead: 0.0, fire_tol_deg: 5.0, strafe: 0.0, retreat_hp: 0.0, loot: 0.3, boost: 0.0, drops: 0.0, face_threat: 0.0, defend_range: 25.0, gun_range: 60.0 },
+        LevelParams { name: "medium", aim_sigma_deg: 3.0, react_s: 0.6, lead: 0.6, fire_tol_deg: 3.0, strafe: 0.5, retreat_hp: 0.2, loot: 0.6, boost: 0.0, drops: 0.0, face_threat: 1.0, defend_range: 35.0, gun_range: 75.0 },
+        LevelParams { name: "hard", aim_sigma_deg: 1.5, react_s: 0.35, lead: 0.9, fire_tol_deg: 2.0, strafe: 1.0, retreat_hp: 0.3, loot: 0.9, boost: 1.0, drops: 1.0, face_threat: 1.0, defend_range: 45.0, gun_range: 85.0 },
+        LevelParams { name: "expert", aim_sigma_deg: 0.7, react_s: 0.2, lead: 1.0, fire_tol_deg: 1.2, strafe: 1.0, retreat_hp: 0.35, loot: 1.0, boost: 1.0, drops: 1.0, face_threat: 1.0, defend_range: 55.0, gun_range: 95.0 },
     ]
 }
 
@@ -356,7 +356,7 @@ impl Scripted {
             let d = dist(pos, o.kin.pos);
             if let Some(s) = squad {
                 if j == s.outsider && !s.hunter[me] {
-                    let attacked = m.last_hurt.map_or(false, |h| h.by == Some(j as i32) && t - h.t < 6.0);
+                    let attacked = m.last_hurt.map_or(false, |h| h.by == Some(j as i32) && t - h.t < 4.0);
                     if d > p.defend_range && !attacked {
                         continue;
                     }

@@ -110,21 +110,82 @@ fn crc32(data: &[u8], mut c: u32) -> u32 {
     c
 }
 
-/// Minimal PNG encoder (stored deflate blocks, no compression).
+struct Bits {
+    out: Vec<u8>,
+    acc: u32,
+    n: u32,
+}
+impl Bits {
+    /// Append `n` bits, least significant first.
+    fn put(&mut self, v: u32, n: u32) {
+        self.acc |= v << self.n;
+        self.n += n;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+    /// Append a Huffman code (most significant bit first).
+    fn code(&mut self, v: u32, n: u32) {
+        let mut r = 0;
+        for k in 0..n {
+            r |= ((v >> k) & 1) << (n - 1 - k);
+        }
+        self.put(r, n);
+    }
+    fn sym(&mut self, s: u32) {
+        match s {
+            0..=143 => self.code(0x30 + s, 8),
+            144..=255 => self.code(0x190 + s - 144, 9),
+            256..=279 => self.code(s - 256, 7),
+            _ => self.code(0xC0 + s - 280, 8),
+        }
+    }
+}
+
+/// zlib stream with one fixed-Huffman block. Matches only against the pixel to the left
+/// (distance 3), which is plenty for a flat-coloured map.
+fn deflate_rle3(raw: &[u8]) -> Vec<u8> {
+    const BASE: [u32; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    const EXTRA: [u32; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    let mut b = Bits { out: vec![0x78, 0x01], acc: 0, n: 0 };
+    b.put(1, 1); // final block
+    b.put(1, 2); // fixed Huffman
+    let mut i = 0;
+    while i < raw.len() {
+        let mut n = 0;
+        if i >= 3 {
+            while n < 258 && i + n < raw.len() && raw[i + n] == raw[i + n - 3] {
+                n += 1;
+            }
+        }
+        if n >= 3 {
+            let k = (0..29).rev().find(|&k| BASE[k] <= n as u32).unwrap();
+            b.sym(257 + k as u32);
+            b.put(n as u32 - BASE[k], EXTRA[k]);
+            b.code(2, 5); // distance 3
+            i += n;
+        } else {
+            b.sym(raw[i] as u32);
+            i += 1;
+        }
+    }
+    b.sym(256);
+    if b.n > 0 {
+        b.put(0, 8 - b.n);
+    }
+    b.out
+}
+
+/// Minimal PNG encoder (fixed-Huffman deflate with run-length matches only).
 pub fn png(w: usize, h: usize, rgb: &[u8]) -> Vec<u8> {
     let mut raw = Vec::with_capacity((w * 3 + 1) * h);
     for y in 0..h {
         raw.push(0);
         raw.extend_from_slice(&rgb[y * w * 3..(y + 1) * w * 3]);
     }
-    let mut z = vec![0x78, 0x01];
-    let mut chunks = raw.chunks(65535).peekable();
-    while let Some(c) = chunks.next() {
-        z.push(if chunks.peek().is_none() { 1 } else { 0 });
-        z.extend_from_slice(&(c.len() as u16).to_le_bytes());
-        z.extend_from_slice(&(!(c.len() as u16)).to_le_bytes());
-        z.extend_from_slice(c);
-    }
+    let mut z = deflate_rle3(&raw);
     let (mut a, mut b) = (1u32, 0u32);
     for &v in &raw {
         a = (a + v as u32) % 65521;
@@ -156,9 +217,26 @@ pub fn png(w: usize, h: usize, rgb: &[u8]) -> Vec<u8> {
 /// white = outside the zone, red dots = rubbing a wall, orange dots = commanded to move
 /// but almost standing still, magenta dots = took weapon damage, red X = death, small
 /// black x = other mechs' deaths.
-pub fn render(world: &World, tr: &Trace, scale: f32, path: &Path) -> std::io::Result<()> {
-    let b = world.bounds;
-    let scale = scale.clamp(0.25, 8.0);
+pub fn render(world: &World, tr: &Trace, scale: f32, crop: bool, path: &Path) -> std::io::Result<()> {
+    let mut b = world.bounds;
+    let mut scale = scale.clamp(0.25, 8.0);
+    if crop && !tr.pts.is_empty() {
+        // crop to the path (plus a margin) and zoom in
+        let (mut x0, mut x1, mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+        for p in &tr.pts {
+            x0 = x0.min(p.pos[0]);
+            x1 = x1.max(p.pos[0]);
+            y0 = y0.min(p.pos[1]);
+            y1 = y1.max(p.pos[1]);
+        }
+        let m = 50.0;
+        b.min_x = (x0 - m).max(b.min_x);
+        b.max_x = (x1 + m).min(b.max_x);
+        b.min_y = (y0 - m).max(b.min_y);
+        b.max_y = (y1 + m).min(b.max_y);
+        let span = (b.max_x - b.min_x).max(b.max_y - b.min_y).max(1.0);
+        scale = scale.max((1100.0 / span).clamp(1.0, 6.0));
+    }
     let w = (((b.max_x - b.min_x) * scale).ceil() as usize).max(1);
     let h = (((b.max_y - b.min_y) * scale).ceil() as usize).max(1);
     let mut img = Img { w, h, px: vec![0; w * h * 3] };
@@ -169,7 +247,7 @@ pub fn render(world: &World, tr: &Trace, scale: f32, path: &Path) -> std::io::Re
             let y = b.max_y - (py as f32 + 0.5) / scale;
             let f = world.top_surface(x, y);
             let c = if f.layer == LAYER_TERRAIN {
-                let g = (150.0 + 80.0 * ((world.terrain_height(x, y) - lo) / (hi - lo)).clamp(0.0, 1.0)) as u8;
+                let g = (150.0 + 80.0 * ((world.terrain_height(x, y) - lo) / (hi - lo)).clamp(0.0, 1.0)) as u8 & 0xFC;
                 [g, g, g]
             } else {
                 match world.prisms[(f.layer - 1) as usize].kind {

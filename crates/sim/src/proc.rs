@@ -252,12 +252,12 @@ impl ProcBot {
     }
 
     pub fn send(&mut self, v: &Value) {
+        let mut s = v.to_string();
+        s.push('\n');
+        self.sent_at = Instant::now();
         if let Some(tx) = &self.tx {
-            let mut s = v.to_string();
-            s.push('\n');
             let _ = tx.send(s);
         }
-        self.sent_at = Instant::now();
     }
 
     /// Wait for `ready` (up to `budget_ms`). Sets the name.
