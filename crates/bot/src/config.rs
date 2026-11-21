@@ -74,8 +74,8 @@ tuning! {
     hunt_commit_s = 6.0,
 
     // ---- ranges (m)
-    range_gun_min = 70.0,
-    range_gun_max = 120.0,
+    range_gun_min = 140.0,
+    range_gun_max = 190.0,
     /// With lightning (and energy) close to this distance.
     range_lightning = 28.0,
     /// With lightning, rush a target only when it is already this close.
@@ -209,8 +209,8 @@ impl Tuning {
         self.flee_margin = 0.7;
         self.first_strike_range = 0.0;
         self.reengage_hp = 0.92;
-        self.range_gun_min = 80.0;
-        self.range_gun_max = 135.0;
+        self.range_gun_min = 120.0;
+        self.range_gun_max = 175.0;
     }
 
     /// Apply `key=value,key=value`; returns the entries that could not be applied.
