@@ -91,6 +91,9 @@ tuning! {
     // ---- movement
     /// Search radius (walking m) for cover when retreating.
     cover_search = 70.0,
+    /// Attacked by several mechs: look for a spot within this walking distance that hides
+    /// us from all but the one we are shooting (0 = off).
+    split_cover = 0.0,
     /// Step behind cover while the gun reloads if cover is within this walking distance (0 = off).
     tuck_reload_dist = 14.0,
     /// Weight of staying out of the arc of lightning carriers (0 = off).
@@ -146,6 +149,10 @@ tuning! {
     /// While we hold no laser and know where one lies: start no fight with a mech
     /// further away than this (0 = start fights as usual).
     unarmed_strike_range = 60.0,
+    /// ... keeping this far from every enemy on the way to the laser (m).
+    errand_clear = 40.0,
+    /// Target choice: extra weight for a mech that carries a laser.
+    laser_carrier_bonus = 1.0,
     /// While we hold no laser at all: start no fight with a mech further away than this
     /// (0 = no such limit). A gun duel takes twice as long and draws others in.
     no_laser_strike_range = 0.0,

@@ -313,6 +313,8 @@ pub struct Bot {
     wary_on: bool,
     /// Walking into the zone, until properly inside.
     zone_run: bool,
+    /// Spot that hides us from the other attackers while we fight one: (place, chosen at).
+    split: Option<(V3, f32)>,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -410,6 +412,7 @@ impl Bot {
             hunt_until: (-1, -1e9),
             wary_on: false,
             zone_run: false,
+            split: None,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -768,6 +771,10 @@ impl Bot {
             if self.target == Some(foe.id) {
                 s += 0.8;
             }
+            // A laser carrier is the most dangerous of them, and it drops the laser we lack.
+            if foe.weapons & W_LASER != 0 {
+                s += if f.has(W_LASER) { tune.laser_carrier_bonus * 0.4 } else { tune.laser_carrier_bonus };
+            }
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, *foe));
             }
@@ -1015,6 +1022,10 @@ impl Bot {
         // 4b. Enemies about that we do not want to fight (a group, or we are not healthy):
         //     get out of their sight and let whoever hunts us come round the corner alone.
         if sit.wary && need == 0 {
+            if let Some((g, climb)) = self.laser_run(f, obs, sit) {
+                let d = self.drive_to(f, obs, g, 0.4, climb);
+                return Intent::new(Mode::Loot, d, 2.0);
+            }
             if let Some(g) = self.quick_grab(f, obs, sit, 70.0, 55.0) {
                 let d = self.drive_to(f, obs, g, 0.4, false);
                 return Intent::new(Mode::Loot, d, 2.0);
@@ -1213,6 +1224,22 @@ impl Bot {
         }
     }
 
+    /// The laser we lack, if we can walk to it now without passing close to an enemy:
+    /// its place and whether the way needs a climb. Used to keep fetching it while
+    /// fighting or while keeping clear of bystanders.
+    fn laser_run(&self, f: &Frame, obs: &Obs, sit: &Sit) -> Option<(V3, bool)> {
+        if self.tune.errand_range <= 0.0 {
+            return None;
+        }
+        let (p, climb) = self.wanted_laser(f, obs, sit)?;
+        let arc = self.cfg.weapons.get("lightning").range;
+        let clear_of_all = sit.foes.iter().filter(|x| x.age < 6.0).all(|x| {
+            let clear = if x.weapons & W_LIGHTNING != 0 { arc + 15.0 } else { self.tune.errand_clear.min(x.dist * 0.7) };
+            seg_dist2([x.pos[0], x.pos[1]], f.xy, [p[0], p[1]]) >= clear
+        });
+        if clear_of_all { Some((p, climb)) } else { None }
+    }
+
     /// Something worth walking to while we fight `tg`: the laser we lack, a cube, a
     /// weapon for an empty slot - if the way there does not lead towards any enemy.
     fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<V3> {
@@ -1232,13 +1259,11 @@ impl Bot {
                 if x.id == tg.id && !near {
                     keep = keep.max(0.6 * tg.dist.min(rmin));
                 }
-                if prize && !lightning {
-                    // The laser doubles our damage: fetch it unless it lies at an enemy's
-                    // feet or the enemy stands between us and it.
-                    keep = 22.0f32.min(dist2d(x.pos, f.pos) * 0.6);
-                    if dist2d(x.pos, p) + 8.0 < dist2d(p, f.pos) {
-                        return false;
-                    }
+                if prize {
+                    // The laser doubles our damage: fetch it unless the way there passes
+                    // close to an enemy (closer than we already are to it, within limits).
+                    let clear = if lightning { arc + 15.0 } else { self.tune.errand_clear.min(dist2d(x.pos, f.pos) * 0.7) };
+                    return seg_dist2([x.pos[0], x.pos[1]], f.xy, [p[0], p[1]]) >= clear;
                 }
                 dist2d(x.pos, p) >= keep
             })
@@ -1282,11 +1307,73 @@ impl Bot {
         let sw = self.tune.strafe_weight;
         let has_lightning = f.has(W_LIGHTNING);
 
+        if let Some((g, climb)) = self.laser_run(f, obs, sit) {
+            let d = self.drive_to(f, obs, g, 0.4, climb);
+            let mut it = Intent::new(Mode::Fight, d, 1.9);
+            it.strafe = Some((side, 0.45 * sw));
+            return it;
+        }
         if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
             let d = self.drive_to(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
             return it;
+        }
+
+        // Several mechs shooting at us: put a building between us and the others, and
+        // keep the line of fire to the one we are killing. One enemy at a time.
+        if self.tune.split_cover > 0.0 {
+            let mh = self.cfg.mech.muzzle_height;
+            let others: Vec<(V3, f32)> = sit
+                .foes
+                .iter()
+                .filter(|x| x.id != tg.id && x.age < 2.5 && x.engaged)
+                .map(|x| ([x.pos[0], x.pos[1], x.pos[2] + mh], self.model.tracks[x.ti].dmg_to_us))
+                .collect();
+            if others.is_empty() {
+                self.split = None;
+            } else {
+                let h = f.body.height;
+                let world = self.world.clone();
+                let hidden = |p: V3, m: V3| !world.los(m, [p[0], p[1], p[2] + h * 0.5]) && !world.los(m, [p[0], p[1], p[2] + h]);
+                let tg_mid = [tg.pos[0], tg.pos[1], tg.pos[2] + self.cfg.mech.height * 0.5];
+                let sees_target = |p: V3| world.los([p[0], p[1], p[2] + me.stats.muzzle_height], tg_mid);
+                let stale = self.split.map_or(true, |(c, at)| t - at > 0.7 || (dist2d(c, f.pos) < 3.0 && !others.iter().all(|o| hidden(f.pos, o.0))));
+                if stale && f.can_plan() {
+                    let worst = others.iter().fold(others[0], |a, b| if b.1 > a.1 { *b } else { a }).0;
+                    let nav = &self.navs[f.nav_idx].1;
+                    let cands = nav.cover_points(f.pos, worst, self.tune.split_cover, h, 24);
+                    let mut best: Option<(f32, V3)> = None;
+                    for c in &cands {
+                        let p = c.pos;
+                        if !f.zone.inside_at([p[0], p[1]], t + 5.0, 6.0) || dist2d(p, tg.pos) < 0.5 * tg.dist.min(rmin) {
+                            continue;
+                        }
+                        let seen_by = others.iter().filter(|o| !hidden(p, o.0)).count() as f32;
+                        let mut sc = c.path_dist + 40.0 * seen_by;
+                        // keep shooting the target from there if we can shoot it now
+                        if tg.los && !sees_target(p) {
+                            sc += 25.0;
+                        }
+                        if let Some((cur, _)) = self.split {
+                            if dist2d(cur, p) < 4.0 {
+                                sc -= 8.0;
+                            }
+                        }
+                        if best.map_or(true, |b| sc < b.0) {
+                            best = Some((sc, p));
+                        }
+                    }
+                    self.split = best.map(|b| (b.1, t));
+                }
+                if let Some((c, _)) = self.split {
+                    let d = self.drive_to(f, obs, c, 1.5, false);
+                    let mut it = Intent::new(Mode::Fight, d, if d.arrived { 0.0 } else { 2.0 });
+                    it.strafe = Some((side, if d.arrived { 0.25 * sw } else { 0.45 * sw }));
+                    it.boost = d.remaining > 12.0 && me.energy > 25.0;
+                    return it;
+                }
+            }
         }
 
         // Step behind cover while the gun reloads (or the laser recovers and the gun is dry).
@@ -1633,6 +1720,14 @@ fn incoming_hits(f: &Frame, obs: &Obs, c: V2, speed: f32, accel: f32, shells: &[
         }
     }
     hits
+}
+
+/// Distance from point `q` to the segment `a`-`b` (2D).
+fn seg_dist2(q: V2, a: V2, b: V2) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let k = if l2 > 1e-6 { (((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    (q[0] - a[0] - ab[0] * k).hypot(q[1] - a[1] - ab[1] * k)
 }
 
 fn cfg_proj_radius() -> f32 {
