@@ -320,7 +320,9 @@ impl Model {
                 return true;
             }
             let gone_for = t - tr.seen_t;
-            if !tr.npc && someone_died && gone_for < 0.3 && tr.seen_t - tr.los_t < memory - 1.0 {
+            // (Drones are not counted in `alive`: one that drops out of the list while the
+            // server would still be tracking it has been destroyed.)
+            if (tr.npc || someone_died) && gone_for < 0.3 && tr.seen_t - tr.los_t < memory - 1.0 {
                 return false; // died (or left for good): do not chase a ghost
             }
             gone_for < if tr.npc { 20.0 } else { 30.0 }
@@ -349,7 +351,10 @@ impl Model {
             if t - seen_t > keep_s {
                 return false;
             }
-            if should_see(p, h) {
+            // (Standing on the spot counts too: had it been there we would have picked it up
+            // or would see it, whatever the ground does to the sight line.)
+            let at_feet = dist2d(p, eye) < 2.5 && (p[2] + me.stats.eye_height - eye[2]).abs() < 3.0;
+            if at_feet || should_see(p, h) {
                 *missing += dt;
                 if *missing > MISSING_S {
                     ghosts.push((id, t + GHOST_S));

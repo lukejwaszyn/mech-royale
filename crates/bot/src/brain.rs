@@ -1444,8 +1444,15 @@ impl Bot {
             }
         }
 
+        // Arriving: ease off so that we stop on the spot instead of running past it and
+        // turning round (a full-speed step is more than a metre).
+        if intent.base_w > 0.0 && d.remaining < 2.4 && len2(cmd) > 0.5 && dot2(cmd, d.dir) > 0.9 && !intent.boost {
+            let k = (d.remaining / 2.4).clamp(0.3, 1.0);
+            cmd = [cmd[0] * k, cmd[1] * k];
+        }
+
         // stuck recovery (only when we are trying to get somewhere, not while strafing on the spot)
-        let travelling = intent.base_w > 0.0 && len2(d.dir) > 0.5;
+        let travelling = intent.base_w > 0.0 && len2(d.dir) > 0.5 && d.remaining >= 2.4;
         if let Some(r) = self.mover.unstick(me, cmd, !travelling, t, f.dt, self.tune.stuck_time_s, &mut self.rng) {
             return (r.dir, r.jet, r.jump);
         }
