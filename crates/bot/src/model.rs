@@ -40,6 +40,8 @@ pub struct Track {
     pub in_obs: bool,
     /// Clear line of fire between our muzzle and its body right now.
     pub los: bool,
+    /// Last time that line of fire was clear.
+    pub fire_los_t: f32,
     pub hit_us_t: f32,
     /// Damage it dealt to us, decaying with a 3 s time constant.
     pub dmg_to_us: f32,
@@ -311,6 +313,9 @@ impl Model {
                     tr.seen_t = t;
                     tr.in_obs = true;
                     tr.los = los;
+                    if los {
+                        tr.fire_los_t = t;
+                    }
                     if eye_los {
                         tr.los_t = t;
                     }
@@ -335,6 +340,7 @@ impl Model {
                     los_t: if eye_los { t } else { -1e9 },
                     in_obs: true,
                     los,
+                    fire_los_t: if los { t } else { -1e9 },
                     hit_us_t: known.map_or(-1e9, |k| k.t),
                     dmg_to_us: known.map_or(0.0, |k| k.dmg),
                     we_hit_t: -1e9,

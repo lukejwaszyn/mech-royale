@@ -31,6 +31,10 @@ struct Hop {
     left_ground: bool,
     /// Horizontal length of the hop when it started.
     span: f32,
+    /// Where the hop started, the ground end of its access, and whether it goes up.
+    from: V3,
+    ground: V3,
+    up: bool,
 }
 
 #[derive(Default)]
@@ -49,7 +53,16 @@ pub struct Mover {
     recover_jet: bool,
     last_stuck_t: f32,
     pub stuck_count: u32,
+    /// Hops that did not get us there, per access (its ground point): count of failures.
+    /// An access that failed twice is not used again this match - the map (or the
+    /// rules) are not what the nav grid assumed there.
+    failed_hops: Vec<(V3, u32)>,
+    /// Hops that ended without arriving (diagnostics).
+    pub hop_failures: u32,
 }
+
+/// Failed hops after which an access is given up.
+const HOP_TRIES: u32 = 2;
 
 /// Energy to jet `climb` metres up, with a margin for hovering over the edge.
 pub fn climb_energy(climb: f32, jp: &JetParams) -> f32 {
@@ -74,16 +87,37 @@ impl Mover {
     pub fn path_points(&self) -> &[V3] {
         &self.path
     }
+    /// Has hopping through this access failed too often?
+    pub fn access_bad(&self, a: &Access) -> bool {
+        self.failed_hops.iter().any(|(g, n)| *n >= HOP_TRIES && dist2d(*g, a.ground) < 1.0 && (g[2] - a.ground[2]).abs() < 2.0)
+    }
+    fn note_hop_end(&mut self, h: &Hop, me: &SelfObs) {
+        // Arrived = standing near the far end, at its height.
+        let ok = dist2d(me.pos, h.to) < h.span.max(3.0) * 0.8 + 2.5 && (me.pos[2] - h.to[2]).abs() < 2.5 && (!h.up || me.pos[2] > h.from[2] + 0.5 * (h.to[2] - h.from[2]));
+        if ok {
+            return;
+        }
+        self.hop_failures += 1;
+        if std::env::var("MECH_VERBOSE").is_ok() {
+            eprintln!("[hop-fail] up={} from=({:.1},{:.1},{:.1}) to=({:.1},{:.1},{:.1}) crest={:.1} ended at=({:.1},{:.1},{:.1}) grounded={} e={:.0} left_ground={} need_jump={}", h.up, h.from[0], h.from[1], h.from[2], h.to[0], h.to[1], h.to[2], h.crest, me.pos[0], me.pos[1], me.pos[2], me.grounded, me.energy, h.left_ground, h.need_jump);
+        }
+        let key = h.ground;
+        match self.failed_hops.iter_mut().find(|(g, _)| dist2d(*g, key) < 1.0 && (g[2] - key[2]).abs() < 2.0) {
+            Some((_, n)) => *n += 1,
+            None => self.failed_hops.push((key, 1)),
+        }
+    }
 
     /// Walk (and hop, when `allow_climb`) towards `goal`. `can_plan` = there is time left
     /// in this decision for a path search.
     #[allow(clippy::too_many_arguments)]
     pub fn drive(&mut self, nav: &Nav, me: &SelfObs, goal: V3, arrive_r: f32, t: f32, jp: &JetParams, allow_climb: bool, can_plan: bool) -> Drive {
         let pos = me.pos;
-        if self.hop.is_some() {
+        if let Some(h) = self.hop {
             if let Some(d) = self.do_hop(me, t) {
                 return d;
             }
+            self.note_hop_end(&h, me);
         }
         let straight = dist2d(pos, goal);
         let to_goal = norm2([goal[0] - pos[0], goal[1] - pos[1]]);
@@ -133,7 +167,7 @@ impl Mover {
                 let best = region
                     .access
                     .iter()
-                    .filter(|a| a.climb < reach)
+                    .filter(|a| a.climb < reach && !self.access_bad(a))
                     .min_by(|a, b| {
                         let ca = dist2d(pos, a.ground) + dist(a.top, goal) + a.climb * 3.0;
                         let cb = dist2d(pos, b.ground) + dist(b.top, goal) + b.climb * 3.0;
@@ -168,7 +202,7 @@ impl Mover {
         if me.energy < need.min(me.max_energy - 1.0) {
             return Drive { waiting: true, hard: true, remaining: d + climb, ..Default::default() };
         }
-        self.hop = Some(Hop { to, crest: a.crest, t0: t, need_jump: climb > me.stats.step_up, jumped_t: -1e9, left_ground: false, span: dist2d(me.pos, to) });
+        self.hop = Some(Hop { to, crest: a.crest, t0: t, need_jump: climb > me.stats.step_up, jumped_t: -1e9, left_ground: false, span: dist2d(me.pos, to), from: me.pos, ground: a.ground, up });
         self.path.clear();
         self.do_hop(me, t).unwrap_or_default()
     }

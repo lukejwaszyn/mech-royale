@@ -201,3 +201,34 @@ fn roof_landing_and_walking_off() {
     walk(&w, &mut k, &p, [1.0, 0.0], false, false, &mut e, 40);
     assert!(k.grounded && (k.pos[2] - 20.0).abs() < 1e-3 && k.pos[0] > 22.0, "{:?}", k);
 }
+
+/// A jump taken while walking up a slope leaves the ground (the sideways part of the
+/// first tick used to meet the rising terrain and count as a landing: no jump, and so
+/// no roof hop, ever started on rising ground).
+#[test]
+fn jump_while_walking_uphill() {
+    let (w, p) = (flat_world(), params());
+    // on the gentle ramp (30 degrees, rising towards -y), walking up it
+    let mut k = at(-30.0, -60.0);
+    let mut e = 100.0;
+    walk(&w, &mut k, &p, [0.0, -1.0], false, false, &mut e, 26);
+    assert!(k.grounded && k.pos[2] > 0.5, "walking up the ramp: {:?}", k.pos);
+    let z0 = k.pos[2];
+    walk(&w, &mut k, &p, [0.0, -1.0], false, true, &mut e, 3);
+    assert!(!k.grounded, "the jump left the ground");
+    assert!(k.pos[2] > z0 + 1.0, "and rose: {} -> {}", z0, k.pos[2]);
+}
+
+/// Under an eave a jet is stopped, and the body is slid out from under it whatever the
+/// legs do (protocol §7) - also while it keeps walking towards the building.
+#[test]
+fn eave_slides_the_body_out_even_when_walking_in() {
+    let (w, p) = (flat_world(), params());
+    // beside the bridge deck (x -5..5, base 10): centre outside, cylinder under its edge
+    let mut k = Kin { pos: [6.5, 50.0, 0.0], vel: [0.0; 3], grounded: true };
+    let mut e = 100.0;
+    walk(&w, &mut k, &p, [0.0, 0.0], false, true, &mut e, 1);
+    // jet up while pushing towards the deck: stopped under it, pushed out, then past it
+    walk(&w, &mut k, &p, [-0.3, 0.0], true, false, &mut e, 40);
+    assert!(k.pos[2] > 12.0, "climbed past the deck edge, at {:?}", k.pos);
+}

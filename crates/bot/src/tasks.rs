@@ -110,7 +110,7 @@ impl Bot {
                 if here != Some(nav.comp_of(n)) {
                     let reg = nav.region_of(n)?;
                     let reach = 0.8 * max_climb(me.max_energy, &f.jet);
-                    let a = reg.access.iter().filter(|a| a.climb < reach).map(|a| a.climb).fold(f32::INFINITY, f32::min);
+                    let a = reg.access.iter().filter(|a| a.climb < reach && !self.mover.access_bad(a)).map(|a| a.climb).fold(f32::INFINITY, f32::min);
                     if !a.is_finite() || a > self.tune.max_loot_climb {
                         return None;
                     }
