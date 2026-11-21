@@ -313,6 +313,8 @@ pub struct Bot {
     wary_on: bool,
     /// Walking into the zone, until properly inside.
     zone_run: bool,
+    /// Cover search for keeping clear of bystanders: only spots properly inside the next circle.
+    hide_inside: bool,
     /// Spot that hides us from the other attackers while we fight one: (place, chosen at).
     split: Option<(V3, f32)>,
     // tasks (tasks.rs)
@@ -412,6 +414,7 @@ impl Bot {
             hunt_until: (-1, -1e9),
             wary_on: false,
             zone_run: false,
+            hide_inside: false,
             split: None,
             task: None,
             task_t: -1e9,
@@ -866,7 +869,10 @@ impl Bot {
         }
         // Keep clear of mechs we are not fighting, with hysteresis: a single threshold had
         // us walking to and fro across it.
-        let wary_r = if self.wary_on { tune.avoid_range + 30.0 } else { tune.avoid_range };
+        // (In a small circle there is no room to keep 100 m from everybody: the distance
+        // shrinks with the zone, or avoiding the others would push us out of it.)
+        let room = (0.45 * f.zone.nr).max(12.0);
+        let wary_r = (if self.wary_on { tune.avoid_range + 30.0 } else { tune.avoid_range }).min(room);
         self.wary_on = !sit.fight && sit.foes.iter().any(|x| x.age < 10.0 && x.dist < wary_r);
         sit.wary = self.wary_on;
 
@@ -1031,11 +1037,25 @@ impl Bot {
                 return Intent::new(Mode::Loot, d, 2.0);
             }
             let near = sit.foes.iter().filter(|x| x.age < 10.0).min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)).copied();
-            if let Some(th) = near {
-                let mut it = self.plan_retreat(f, obs, sit, th, false);
-                it.mode = Mode::Hold;
-                it.boost = it.boost && th.dist < 70.0;
-                return it;
+            // Hide from one that is close or looking our way; a distant one that cannot
+            // see us is avoided by simply not walking towards it (the holding spot).
+            let room = (0.45 * z.nr).max(12.0);
+            let pressing = |x: &Foe| x.dist < 0.6 * self.tune.avoid_range.min(room) || (x.los && x.age < 1.0);
+            if let Some(th) = near.filter(|x| !self.tune.ffa || pressing(x) || self.cover.is_some()) {
+                self.hide_inside = true;
+                let it = self.plan_retreat(f, obs, sit, th, false);
+                self.hide_inside = false;
+                // Hide only where we can stay: cover properly inside the next circle.
+                // Otherwise carry on (loot, holding spot) - hiding at the edge had the
+                // bot walking out to the cover and back in for the zone, over and over.
+                // (Practice mode: with no cover, walking away from the mech is still
+                // right - it is one of the squad and the fight would come to us.)
+                if self.cover.is_some() || !self.tune.ffa {
+                    let mut it = it;
+                    it.mode = Mode::Hold;
+                    it.boost = it.boost && th.dist < 70.0;
+                    return it;
+                }
             }
         }
 
@@ -1130,8 +1150,14 @@ impl Bot {
         // Cover the enemy can simply walk up to is no cover: keep a distance, and well
         // outside the arc of a lightning carrier.
         let keep = if th.weapons & W_LIGHTNING != 0 { self.cfg.weapons.get("lightning").range * 1.35 + 12.0 } else { 45.0 };
+        let inner_now = self.tune.zone_inner_margin.min(f.zone.nr * 0.35) * 0.5 + 3.0;
         let cover_bad = match self.cover {
-            Some(c) => !hidden_from(c, tm) || !f.zone.inside_at([c[0], c[1]], t + 4.0, 4.0) || (th.age < 3.0 && dist2d(c, th.pos) < keep),
+            Some(c) => {
+                !hidden_from(c, tm)
+                    || !f.zone.inside_at([c[0], c[1]], t + 4.0, 4.0)
+                    || (th.age < 3.0 && dist2d(c, th.pos) < keep)
+                    || (self.hide_inside && !f.zone.inside_next([c[0], c[1]], inner_now) && f.zone.leaves_at([c[0], c[1]], 5.0).map_or(false, |tl| tl - t < 20.0))
+            }
             None => true,
         };
         if (cover_bad || t - self.cover_t > 1.0) && t - self.cover_t > 0.35 && f.can_plan() {
@@ -1141,9 +1167,13 @@ impl Bot {
             let bearing = norm2([th.pos[0] - f.xy[0], th.pos[1] - f.xy[1]]);
             let side = perp(bearing);
             let mut best: Option<(f32, V3)> = None;
+            let inner = self.tune.zone_inner_margin.min(f.zone.nr * 0.35) * 0.5 + 3.0;
             for c in &cands {
                 let p = c.pos;
                 if !f.zone.inside_at([p[0], p[1]], t + c.path_dist / speed + 4.0, 6.0) {
+                    continue;
+                }
+                if self.hide_inside && !f.zone.inside_next([p[0], p[1]], inner) && f.zone.leaves_at([p[0], p[1]], 5.0).map_or(false, |tl| tl - t < 25.0) {
                     continue;
                 }
                 let mut s = c.path_dist - 0.35 * dist2d(p, th.pos);
