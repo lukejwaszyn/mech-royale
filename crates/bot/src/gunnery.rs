@@ -132,10 +132,34 @@ impl Bot {
             tgt = None;
         }
         let unseen_attacker = t - self.model.last_hurt_t < 2.0 && self.model.last_hurt_by.map_or(true, |id| id < 100 && !sit.foes.iter().any(|x| x.id == id && x.age < 1.0));
+        // Shot by a mech the server does not show us (it is behind us, or we have never
+        // seen it): turn to its shots. Until we face it we cannot fight it, every hit
+        // counts as a rear hit, and whatever we were shooting at matters less than
+        // that - unless the target in front dies to what is already loaded.
+        let mut face_blind: Option<f32> = None;
+        if let Some((id, bearing, dmg)) = sit.blind {
+            if self.blind_face.0 != id {
+                self.blind_face = (id, t, -1e9);
+            }
+            // looked that way for a while and it did not show (out of sight range, or
+            // hidden): stop staring for a few seconds
+            let facing = ang_diff(me.aim[0], bearing).abs() < 0.35;
+            if facing && t - self.blind_face.1 > 1.2 {
+                self.blind_face.2 = t + 3.0;
+            }
+            if !facing {
+                self.blind_face.1 = t;
+            }
+            let finishing = tgt.map_or(false, |x| x.mech && x.los && x.live && x.hp <= self.burst_now(f));
+            if dmg >= tune.blind_turn_dmg && tune.blind_turn_dmg > 0.0 && t >= self.blind_face.2 && !finishing {
+                face_blind = Some(bearing);
+                tgt = None;
+            }
+        }
         // A drone that is shooting at us, when no mech can be shot right now: it is a
         // few seconds of gun fire, it stops the damage (which also blocks regeneration)
         // and it drops cubes. Ignoring drones let them kill a hiding bot.
-        if tgt.map_or(true, |x| !x.los) {
+        if tgt.map_or(true, |x| !x.los) && face_blind.is_none() {
             let drone = self
                 .model
                 .tracks
@@ -146,7 +170,7 @@ impl Bot {
                 tgt = Some(self.tgt_of_track(tr));
             }
         }
-        if tgt.is_none() && !unseen_attacker {
+        if tgt.is_none() && !unseen_attacker && face_blind.is_none() {
             match intent.farm {
                 Some(Farm::Npc(id)) => {
                     if let Some(tr) = self.model.track(id) {
@@ -170,6 +194,9 @@ impl Bot {
 
         // ---- solutions per weapon
         let mut aim = self.look(f, obs, sit, mv, unseen_attacker);
+        if let Some(b) = face_blind {
+            aim = [b, 0.0];
+        }
         let mut reload = false;
         let mut gun_busy = false; // the gun has a shot to take this decision
         if let Some(tg) = tgt {
@@ -263,6 +290,20 @@ impl Bot {
 
         aim[1] = aim[1].clamp(st.min_pitch, st.max_pitch);
         (aim, fire, reload)
+    }
+
+    /// Damage we can put out in the next second or so with what is loaded.
+    pub(crate) fn burst_now(&self, f: &Frame) -> f32 {
+        f.slots
+            .iter()
+            .flatten()
+            .map(|s| match s.bit {
+                W_LASER if s.cooldown < 1.0 => s.stats.damage,
+                W_GUN => s.stats.damage * s.ammo.min(4.0),
+                _ => 0.0,
+            })
+            .sum::<f32>()
+            * f.dmg_scale
     }
 
     /// Mortar decision: returns the aim to command and the settle tolerance when a shot is worth it.

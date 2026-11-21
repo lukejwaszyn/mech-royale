@@ -100,6 +100,19 @@ pub struct Heard {
     pub near: bool,
 }
 
+/// A mech that damaged us, whether or not we have ever seen it (the `damaged` event
+/// names it and gives the bearing the shot came from).
+#[derive(Clone, Copy, Debug)]
+pub struct Attacker {
+    pub id: i64,
+    /// Time of its last hit on us.
+    pub t: f32,
+    /// World yaw towards where its last shot came from.
+    pub bearing: Option<f32>,
+    /// Damage it dealt to us, decaying with a 3 s time constant.
+    pub dmg: f32,
+}
+
 #[derive(Default)]
 pub struct Model {
     pub t: f32,
@@ -128,6 +141,8 @@ pub struct Model {
     /// Without this a thing the server shows from far away but not from close by would
     /// have us walk to it and away from it for ever.
     pub ghosts: Vec<(i64, f32)>,
+    /// Mechs that hit us in the last seconds, seen or not.
+    pub attackers: Vec<Attacker>,
 }
 
 /// Seconds a remembered thing may be missing from view (while we should see it) before we forget it.
@@ -172,6 +187,16 @@ impl Model {
                                 tr.dmg_to_us += amount;
                                 tr.dmg_us_total += amount;
                             }
+                            if by < 100 {
+                                match self.attackers.iter_mut().find(|a| a.id == by) {
+                                    Some(a) => {
+                                        a.t = t;
+                                        a.bearing = e.bearing.or(a.bearing);
+                                        a.dmg += amount;
+                                    }
+                                    None => self.attackers.push(Attacker { id: by, t, bearing: e.bearing, dmg: amount }),
+                                }
+                            }
                         }
                     }
                 }
@@ -188,6 +213,7 @@ impl Model {
                     self.kills += 1;
                     if let Some(id) = e.target {
                         self.tracks.retain(|x| x.id != id);
+                        self.attackers.retain(|x| x.id != id);
                     }
                 }
                 "took" => {
@@ -222,6 +248,10 @@ impl Model {
         let me = &obs.me;
         let decay = (-dt / 3.0).exp();
         self.dmg_recent *= decay;
+        for a in self.attackers.iter_mut() {
+            a.dmg *= decay;
+        }
+        self.attackers.retain(|a| t - a.t < 12.0);
         self.events(obs);
         if obs.alive < self.last_alive && self.last_alive != i32::MAX {
             self.death_t = t;
@@ -285,7 +315,11 @@ impl Model {
                         tr.los_t = t;
                     }
                 }
-                None => self.tracks.push(Track {
+                None => {
+                    // A mech that was already shooting at us before we first saw it
+                    // arrives with that record: it is an attacker from the first moment.
+                    let known = self.attackers.iter().find(|x| x.id == a.id).copied();
+                    self.tracks.push(Track {
                     id: a.id,
                     npc,
                     pos: a.pos,
@@ -301,14 +335,15 @@ impl Model {
                     los_t: if eye_los { t } else { -1e9 },
                     in_obs: true,
                     los,
-                    hit_us_t: -1e9,
-                    dmg_to_us: 0.0,
+                    hit_us_t: known.map_or(-1e9, |k| k.t),
+                    dmg_to_us: known.map_or(0.0, |k| k.dmg),
                     we_hit_t: -1e9,
-                    dmg_us_total: 0.0,
+                    dmg_us_total: known.map_or(0.0, |k| k.dmg),
                     dmg_them_total: 0.0,
                     their_time: 0.0,
                     our_time: 0.0,
-                }),
+                    })
+                }
             }
         }
         // The server keeps listing a mech for memory_s after we lose sight of it. One that
