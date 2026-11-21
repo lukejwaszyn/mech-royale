@@ -15,7 +15,7 @@ Dockerfile     multi-stage build: rust alpine/musl -> empty image with /bot
 
 ```sh
 cargo build --release -p bot                 # target/release/bot
-cargo test  --release -p bot                 # intercept and ballistics math, protocol loop
+cargo test  --release -p bot                 # math, protocol loop, behaviour regressions
 python3 <kit>/check/check.py -- "$PWD/target/release/bot"
 
 docker build -t mech-bot .                   # about 30 s on linux/amd64
@@ -23,9 +23,12 @@ python3 <kit>/check/check.py --map-dir /arena -- docker run --rm -i --network no
     --cpus 1 --memory 512m --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 \
     -v "$PWD/arena:/arena:ro" mech-bot
 
-# a local match against the simulator's guess of the house squad
+# local matches against the simulator's guess of the house squad
 cargo build --release -p sim -p bot
-target/release/sim --bot target/release/bot --fill squad --seed 1 --matches 20
+target/release/sim --bot target/release/bot --fill squad --seed 1 --matches 20      # the real binary over pipes
+target/release/sim --inproc "" --fill squad --seed 1000 --matches 600 --jobs 3 \
+    --stop-when-focus-dies --quiet --detail                                         # tuning runs, about 30 s
+target/release/sim --inproc "range_gun_min=100" --fill squad --matches 600 --jobs 3 --quiet   # try a setting
 ```
 
 Measured on an Apple Silicon laptop: ready in about 1.1 s (map plus five nav grids),
@@ -43,7 +46,7 @@ match sandbox flags passes `check.py` with 300 of 300 answers in time.
 | `MECH_DEBUG=1` | attach debug drawings (path, target line, holding spot) to actions |
 
 Every behaviour number is a field of the one `Tuning` struct in `crates/bot/src/config.rs`
-(aggression, ranges, retreat thresholds, loot values, timing margins), next to the
+(ranges, first strike, laser errands, retreat thresholds, loot values, timing margins), next to the
 upgrade preference table. Rule numbers are never hard-coded: they are read from
 `hello.config`, `self.stats` and `self.weapons[i].stats` on every tick.
 
@@ -120,91 +123,118 @@ fitting under the low bridges.
 **What scores.** Placement is death order. In the practice run the 15 house bots are one
 squad that never fights itself, so before the final circle nobody dies unless we kill it:
 our place is roughly 16 minus our kills at the moment we die, unless we live to the end.
-Kills are the points, survival is what buys more kills, and the squad's weakest come first.
+Kills are the points; survival is what buys more kills.
 
-**Fight only what attacks us, one at a time.** The first version shot every mech it saw;
-in the simulator that turned bystanders into attackers and it died in a crossfire within
-30 seconds. Now a mech is an enemy once it has actually hit us (or charges a laser at us).
-We start a fight ourselves only with a mech that stands alone, that we can see, and that
-is either already weak or clearly weaker than us (cubes, second weapon, or it has shown
-poor aim). Since the squad sends its weakest first, a mech that is *not* hunting us is
-probably a better one. Mechs we are not fighting are kept at a distance (`avoid_range`),
-and loot next to them is ignored.
+Everything below was shaped on the local simulator (`crates/sim`), which is a guess at the
+server and at the house bots. Each rule is there because switching it off cost points over
+600–1500 simulated matches; the numbers in brackets are that difference in mean points.
 
-**The duel estimate decides fight or flight.** For every enemy we keep the damage it dealt
-to us per second while it was shooting at us, and ours on it. From that:
-`margin = (our HP / incoming DPS) / (target HP / our DPS)`. Below `flee_margin` we break
-off even at high HP (a laser carrier out-trading us at 120 m); above `press_margin` we
-keep fighting even at low HP (a hunter that cannot hit). In between, the HP thresholds
-apply. Two or more attackers mean retreat unless the margin is overwhelming.
+**The laser decides the match** [about +1.5]. Hitscan, 315 damage every 2.4 s at any range,
+on top of the gun: with a laser a kill takes half as long. Matches in which the bot gets a
+laser average 5.4 points in the simulator, the others 2.0. So:
 
-**Retreat means breaking line of sight, at a distance.** Cover points come from the nav
-grid: hidden from the main threat, preferably also from where it would be after a
-sidestep and from the other enemies, inside the zone, and not where the enemy can walk
-up to us — 45 m away, more from a lightning carrier. Out of sight for `regen_delay`
-seconds we regenerate 45 HP/s, and we do not fire at what cannot see us (dealing damage
-restarts the clock). If we are still being shot after 2.5 s the cover is not working: we
-turn and take the weakest one with us, because a kill is a point.
+* weapon values are laser ≫ mortar > lightning (`w_laser`, `w_mortar`, `w_lightning`), and
+  a laser replaces whichever special weapon we carry;
+* for a laser the bot walks further (`laser_range`), closer past mechs it is not fighting
+  (`laser_keep`), and up onto roofs;
+* it keeps walking to a known laser **during** a fight and past bystanders, as long as the
+  straight way there stays `errand_clear` metres from every enemy (`laser_run`);
+* while it knows of a laser it holds none of, it starts no fight beyond
+  `unarmed_strike_range`;
+* the laser keeps charging while we back away (charging halves our speed, which only
+  matters next to a lightning carrier).
 
-**Range.** Lightning never misses inside 45 m, whoever pilots it, so we stay about 60 m or
-more from any lightning carrier unless we carry one too and have the HP to win. Otherwise
-we fight at 70–120 m, strafing: at that range visible bullets can be side-stepped and
-weak bots without lead miss a jinking target, while our lead still hits. An enemy that
-closes in is kited: the legs back away at full speed while the torso keeps facing and
-firing.
+**Fight at long range** [+0.5]: `range_gun_min`–`range_gun_max` = 140–190 m. Inaccurate
+opponents hit in proportion to our angular size, our own gun and laser still hit, and
+visible bullets take 0.6 s to arrive. An enemy that closes in is kited: the legs back away
+while the torso keeps firing. Kiting never walks into a wall [`wall_penalty`], out of the
+zone, or towards other mechs [`crowd_avoid`, +0.2].
 
-**Finish.** A target below 30% HP is chased with boost to close range before it can break
-away and regenerate, and it outranks a fresh attacker when choosing whom to shoot. Its
-cubes (all it had plus two) are picked up during the fight when they lie within reach.
+**Stay out of lightning arcs** [+0.25]. Lightning never misses inside 45 m and does 240
+damage per second. Every known carrier is a repulsor in the steering, in every mode, and
+inside arc range + 8 m the bot boosts away.
 
-**Get stronger while it is quiet.** Weapon pickups first (laser > lightning > mortar,
-shifted by the weapon triangle against what the enemies we have seen carry; a mortar is
-worth little because carrying one makes enemy lasers hit 60% harder), then cubes, crates
-and drones (shooting them restarts regeneration, so only when healthy and nobody is near),
-supply drops when uncontested (three cubes, full HP and energy). With nothing known, the
-bot walks around inside the next circle looking for loot until it has a second weapon and
-a few cubes. Upgrades: max HP first (it also counts in the final zone race, where armor
-does not), then armor, regeneration, damage. Cubes stop adding HP and damage at 10 but
-keep growing the mech, so collecting stops there.
+**Shoot first, at what is coming** [+0.2]. A mech that walks towards us or lines us up
+inside `first_strike_range` is one of the squad on its way to shoot us; it is attacked
+before it opens fire (practice mode only). A mech in plain sight that one more burst will
+finish is always shot (`kill_shot_range`). Having opened fire we stay on the target for
+`hunt_commit_s`: a hunt that stops when a condition flickers has only made an enemy.
+Bystanders that are neither attacking nor coming are still left alone and kept at
+`avoid_range` (with hysteresis), walking away from them even when there is no cover.
+
+**No running in practice mode** [+0.25]. The squad shares vision and keeps coming, cover is
+seldom close enough to regenerate behind, and a retreat in the open gives away free hits.
+`retreat_hp`, `flee_margin` and `max_enemies` are therefore off by default; the retreat
+code (cover search, last stand) is still there and is used by the free-for-all preset.
+
+**Drones shoot back at.** A drone that hits us is shot when no mech can be: it stops the
+damage, which also blocks regeneration, and drops two cubes. Ignored drones used to kill
+a bot that was hiding from mechs.
+
+**Loot.** Cubes, crates, drones and supply drops as before, valued per second of walking;
+the current values are a local optimum in the simulator. A task is judged leniently once
+chosen, so that a mech drifting near the goal does not send the bot back and forth. Loot
+outside the next circle is judged at the loot (will the circle have passed it when we get
+there?), never at where we stand — that rule used to flip as the bot crossed the line and
+had it pacing up and down. Loot the bot should see and does not (close by, clear line
+past buildings and tree trunks) is forgotten after 0.6 s and not believed again from afar.
 
 **Zone.** A walking-distance field to the inside of the next circle is rebuilt each phase.
 We leave when the closing edge would reach our position within a margin plus the detour
-the buildings force, or when the walk would not finish before the shrink ends; outside the
-zone we boost. In the last phase the circle closes to nothing and its damage ignores
-armor: every metre from the centre is a second more of 260 HP/s, so the bot goes to the
-centre and stays there.
+the buildings force, and once on the way in we keep going until properly inside, fight or
+no fight. In the last phase the circle closes to nothing: the bot goes to the centre and
+stays there.
 
 **Free-for-all (`MECH_MODE=ffa`).** For the final against other teams' bots: never starts
-a fight with a healthy mech, only finishes weak ones; retreats earlier, re-engages later,
-keeps a longer range. Other bots kill each other there, so outlasting them is worth more
-than kills.
+a fight with a healthy mech, only finishes weak ones; retreats to cover when hurt or
+outnumbered, re-engages late. In a small circle the distance kept from bystanders shrinks
+with the circle, and the bot hides only where the zone lets it stay.
 
 ## What is verified and what is not
 
-Verified here: the unit tests (intercept, mortar, laser damage, aim settling, tuning
-overrides), the protocol tests (recorded stream through the in-process session, garbage
-input, missing map, the real binary over pipes including queued observations and exit),
-`check.py` on the native binary and on the amd64 image in the match sandbox.
+Verified here:
 
-The only closed-loop feedback was `crates/sim`, which is a guess at the real server and
-at the house bots. There the bot scored about 2.1–2.6 points per match against the
-simulated squad, where the kit's example bot scored 0.33 and the simulator's own "expert"
-script 0.70; against idle opponents it won every full-length match, and six copies in
-ffa mode played to the final circle with no late answers. The simulator is harsher than
-the real practice run (the example bot scores 1.15 there), so these numbers say that the
-bot plays coherently, not what it will score. Parameter sweeps on the simulator moved
-the mean by less than its noise, so the defaults are judgement, not fits.
+* unit tests (intercept, mortar, laser damage, aim settling, tuning overrides);
+* protocol tests (recorded stream through the in-process session, garbage input, missing
+  map, the real binary over pipes including queued observations and exit);
+* behaviour tests (`crates/bot/tests/behaviour.rs`): one small synthetic situation per bug
+  the simulator exposed — loot memory and ghosts, destroyed drones, shooting back at
+  drones, the loot rule at the next circle's edge, the laser while kiting, lightning arcs,
+  first strike only in practice mode, kill shots, no running from a single attacker;
+* `check.py` on the native binary and on the amd64 image in the match sandbox.
 
-Not exercised against real opponents: mortar and laser use by us in volume, roof hops for
-loot, the endgame centre race under fire.
+Closed-loop numbers, all from `crates/sim` (see its README; they do not predict the
+leaderboard — the kit's example bot scores about 0.3 there and 1.15 in the real practice
+run):
 
-Things to look at after the first practice score:
+| | mean of 16 − place |
+|---|---|
+| bot as first written, against the simulated squad | 2.4 |
+| this version, against the simulated squad (1500 matches) | 4.4 |
+| this version, starting with a laser (the ceiling of "get a laser sooner") | 5.4 |
+| this version, 15 scripted bots each for itself | 13.1 |
 
-* If non-hunting house bots really ignore us until shot at, raise `aggression` and lower
-  `hunt_power_ratio`; if they shoot on sight from far away, raise `avoid_range`.
-* `range_gun_min` / `range_gun_max` against how well the house bots lead.
+Open problems, largest first:
+
+* **No laser in 28% of matches** (15% never see one, 13% see one and do not reach it);
+  those matches average 2.0 points. Looking for one deliberately, and killing laser
+  carriers for theirs, is the obvious next step.
+* **Three or more attackers at once** is still simply lost. A rule that moves to a spot
+  hidden from all but the current target exists (`split_cover`) but made no difference
+  in the simulator and is off.
+* **Lightning in our own hands** is worth nothing as played (rushing costs as much as it
+  gains), so it is valued low. A corner ambush would be the way to use it.
+* The free-for-all preset cannot be judged here: the scripted free-for-all is far too
+  bloody, and sixteen copies of this bot mostly stand apart until the last circle.
 * The final centre is taken as the nearest walkable ground; a roof over the centre is not
-  used yet.
+  used.
+
+Things to look at after the first real practice score:
+
+* If the real squad's non-hunters ignore us until shot at, `first_strike_range` and the
+  hunt rules are worth more; if they shoot on sight from far away, raise `avoid_range`.
+* `range_gun_min` / `range_gun_max` against how well the house bots aim at 150 m.
+* `retreat_hp` and `flee_margin` if the real hunters lose track of a hidden mech.
 
 ## License
 

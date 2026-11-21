@@ -24,6 +24,11 @@ target/release/sim --bots 16 "python3 -u '/path/to/mechfight-kit/python/example_
 # no process at all: a scripted "hard" bot as the outsider against the squad
 target/release/sim --fill squad --focus-level hard --matches 10
 
+# tuning runs: our bot in-process (no pipes, shared nav grids), three matches at a time,
+# with the damage statistics and the bot's own counters - 600 matches in about 30 s
+target/release/sim --inproc "" --fill squad --seed 1000 --matches 600 --jobs 3 --stop-when-focus-dies --quiet --detail
+target/release/sim --inproc "range_gun_min=100,w_laser=20" --fill squad --seed 1000 --matches 600 --jobs 3 --quiet
+
 # debugging one match: replay + a zoomed picture of our path
 target/release/sim --bot target/release/bot --seed 3 --replay /tmp/r.jsonl --trace /tmp/t.png --trace-crop
 ```
@@ -44,6 +49,15 @@ of match time). The same seed gives the same match as long as the bots are
 deterministic and never late.
 
 ### Bots and slots
+
+* `--inproc TUNE` (repeatable) and `--inprocs N TUNE` add our own bot (`crates/bot`)
+  driven **in-process**: the same decisions through the same JSON, but no pipes, no
+  timing checks, and the map and nav grids are reused between matches, so a match takes
+  about 0.1 s instead of 0.8 s. `TUNE` is a `MECH_TUNE` list (`""` = defaults, `ffa=1` =
+  the free-for-all preset). Results match the process bot on the same seeds up to the
+  bot's own timing-dependent choices. Use `--bot` for protocol and timing checks and
+  `--inproc` for comparing settings; `--jobs N` plays N matches at a time (in-process and
+  scripted bots only - process bots would compete for the CPU and look late).
 
 * `--bot CMD` (repeatable) and `--bots N CMD` add process bots; the command line is
   split like a shell would (quotes, backslashes; no variable expansion).
@@ -80,6 +94,21 @@ as the server does. `--no-enforce` still counts late answers but uses them (wait
 to `--wait-ms`), which keeps a match reproducible while you look for slow decisions.
 The `debug` field of an action is ignored and not checked against the caps
 (`check/check.py` in the kit does that).
+
+### Statistics (`--detail`)
+
+Per match, for the focus bot: who damaged it and by how much (`(H)` = a squad hunter when
+it died), by which weapon, its gun hits / shots, the number of hunters at the end, and -
+for an in-process bot - the bot's own counters (`bot::brain::Diag`: seconds per mode,
+leg reversals while nobody was shooting, idle seconds, zone damage, seconds with 1 / 2 / 3+
+attackers, seconds without a second weapon and with a laser, ...). The summary adds the
+means per match: damage dealt per weapon, damage taken per opponent level and per weapon,
+who killed it, gun accuracy, seconds spent rubbing walls. Two examples of what this found:
+half of all damage came from "easy" bots because the bot let them walk up to 70 m, and a
+third of all matches were lost for want of a laser the bot knew about.
+
+`--focus-weapon KIND` starts the focus bot with a mortar, laser or lightning: an
+experiment to measure what a weapon is worth to the current bot.
 
 ### Replay and trace
 
@@ -233,6 +262,7 @@ is silent or ambiguous.
 | `src/sim.rs` | match state, actions, weapons, damage, zone, loot, drones, drops, deaths |
 | `src/obs.rs` | the `obs` message and replay frames |
 | `src/proc.rs` | process bots: spawn, timing, protocol counters |
+| `src/runner.rs` (`InProc`) | our bot in-process, with a pool of nav grids per thread |
 | `src/scripted.rs` | scripted levels and the squad coordinator |
 | `src/runner.rs` | one match from `hello` to `end`; `Env`, `MatchSpec`, `RunOpts` (usable as a library) |
 | `src/render.rs` | trace image and a tiny PNG encoder |
@@ -253,4 +283,5 @@ is silent or ambiguous.
 * `tests/matches.rs` — whole matches on the real map: a scripted squad match completes,
   is reproducible and has no friendly kills; a free-for-all has fights and one winner;
   shell-script bots that answer correctly, with a wrong tick, with garbage, crash, stay
-  silent or answer late are each reported as such.
+  silent or answer late are each reported as such; our bot in-process plays a squad
+  match, its statistics add up, and the same seed gives the same match.

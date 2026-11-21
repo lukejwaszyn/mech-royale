@@ -135,3 +135,33 @@ fn late_answers_are_dropped_and_the_mech_coasts() {
     assert_eq!((s.late, s.stale), (s.sent, 0), "{s:?}");
     assert!(r.bots[0].dmg_dealt >= 0.0);
 }
+
+/// Our own bot driven in-process (`--inproc`): it plays a squad match to its death with
+/// no protocol problems, the same seed gives the same match, and the statistics that
+/// `--detail` reports add up.
+#[test]
+fn inproc_bot_plays_a_squad_match_and_statistics_add_up() {
+    let env = env_with(|_| {});
+    let mut bots = vec![BotSpec::InProc(String::new())];
+    for k in 0..15 {
+        bots.push(BotSpec::Scripted(k % 4));
+    }
+    let spec = MatchSpec { bots, focus: 0, squad: true };
+    let arena = std::env::var("MECH_ARENA").map(std::path::PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../arena"));
+    let opts = RunOpts { map_dir: arena.to_string_lossy().into_owned(), stop_when_focus_dies: true, ..RunOpts::default() };
+    let a = run_match(&env, &spec, &opts, 11).unwrap();
+    let f = &a.bots[0];
+    let p = f.proto.as_ref().expect("protocol statistics for the in-process bot");
+    assert!(p.sent > 50 && p.answered == p.sent, "every observation answered ({} of {})", p.answered, p.sent);
+    assert_eq!(p.problems(), 0);
+    assert!(!f.diag.is_empty(), "the bot's own counters are reported");
+    // damage taken = sum over attackers + zone + drones; and per weapon
+    let by_weapon: f32 = f.dmg_by_weapon.iter().map(|x| x.1).sum();
+    assert!((by_weapon - f.dmg_taken).abs() < 1.0, "per-weapon damage {} vs total {}", by_weapon, f.dmg_taken);
+    let from_mechs: f32 = f.dmg_from.iter().sum();
+    assert!(from_mechs <= f.dmg_taken + 1.0);
+    assert!(f.gun_hits <= f.gun_shots);
+    // the second match reuses the nav grids of the first and is identical
+    let b = run_match(&env, &spec, &opts, 11).unwrap();
+    assert_eq!((f.place, f.kills, f.death.as_ref().map(|d| (d.t * 10.0) as i64)), (b.bots[0].place, b.bots[0].kills, b.bots[0].death.as_ref().map(|d| (d.t * 10.0) as i64)));
+}
