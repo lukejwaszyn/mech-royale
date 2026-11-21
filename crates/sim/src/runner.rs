@@ -64,6 +64,8 @@ pub struct RunOpts {
     pub squad_late_alive: usize,
     pub squad_deaths_per_hunter: f32,
     pub squad_omniscient: bool,
+    /// Experiment: the focus bot starts with this weapon in its second slot.
+    pub focus_weapon: Option<crate::config::WKind>,
 }
 
 impl Default for RunOpts {
@@ -88,6 +90,7 @@ impl Default for RunOpts {
             squad_late_alive: 6,
             squad_deaths_per_hunter: 1.0,
             squad_omniscient: false,
+            focus_weapon: None,
         }
     }
 }
@@ -128,6 +131,8 @@ pub struct BotResult {
     pub gun_shots: u32,
     pub gun_hits: u32,
     pub dealt_by_weapon: Vec<(&'static str, f32)>,
+    /// The in-process bot's own counters (`bot::brain::Diag`).
+    pub diag: Vec<(&'static str, f32)>,
     /// Was this bot one of the squad's hunters when the focus bot died (or the match ended)?
     pub hunter: bool,
 }
@@ -255,6 +260,9 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
         slot_of[b] = slot;
     }
     let focus_slot = slot_of[spec.focus.min(n - 1)];
+    if let Some(k) = opts.focus_weapon {
+        sim.give_weapon(focus_slot, k);
+    }
 
     let mut ctl: Vec<Ctl> = Vec::with_capacity(n);
     let mut names: Vec<String> = Vec::with_capacity(n);
@@ -484,6 +492,10 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             gun_shots: m.gun_shots,
             gun_hits: m.gun_hits,
             dealt_by_weapon: m.dealt_by_weapon.clone(),
+            diag: match &ctl[slot] {
+                Ctl::InProc(ip) => ip.bot.as_ref().map(|b| b.diag.list(b.mover.stuck_count)).unwrap_or_default(),
+                _ => Vec::new(),
+            },
             hunter: hunters_at_end.get(slot).copied().unwrap_or(false),
         });
     }

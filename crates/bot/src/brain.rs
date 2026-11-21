@@ -211,6 +211,71 @@ pub struct Timing {
     pub over_20: u32,
 }
 
+/// Counters for finding misbehaviour over many simulated matches (never used to decide).
+#[derive(Default, Clone, Debug)]
+pub struct Diag {
+    /// Seconds per [`Mode`] (Final, Zone, Retreat, Fight, Loot, Hold).
+    pub mode_s: [f32; 6],
+    /// Leg command reversed (more than 120 degrees) while nobody was shooting.
+    pub flips: u32,
+    /// Seconds standing still on the ground with nothing to shoot and nothing to wait for.
+    pub idle_s: f32,
+    /// Seconds outside the zone, and zone damage taken.
+    pub out_zone_s: f32,
+    pub zone_dmg: f32,
+    pub take_failed: u32,
+    pub took: u32,
+    /// Weapon damage taken, and the part of it that came from behind.
+    pub dmg_taken: f32,
+    pub dmg_rear: f32,
+    /// Seconds with an enemy mech in a clear line of fire, and of those with a trigger down.
+    pub los_s: f32,
+    pub firing_s: f32,
+    /// Seconds with 1 / 2 / 3+ mechs attacking us.
+    pub engaged_s: [f32; 3],
+    /// Gun reloads started with more than a quarter of the magazine left while an enemy was in sight.
+    pub early_reloads: u32,
+    /// Seconds alive, seconds without a second weapon, seconds holding a laser.
+    pub alive_s: f32,
+    pub unarmed_s: f32,
+    pub laser_s: f32,
+    /// Seconds without a laser while we knew where one lies.
+    pub laser_known_s: f32,
+}
+
+impl Diag {
+    /// Flat (name, value) list for the simulator's report.
+    pub fn list(&self, stuck: u32) -> Vec<(&'static str, f32)> {
+        vec![
+            ("final_s", self.mode_s[0]),
+            ("zone_s", self.mode_s[1]),
+            ("retreat_s", self.mode_s[2]),
+            ("fight_s", self.mode_s[3]),
+            ("loot_s", self.mode_s[4]),
+            ("hold_s", self.mode_s[5]),
+            ("flips", self.flips as f32),
+            ("stuck", stuck as f32),
+            ("idle_s", self.idle_s),
+            ("out_zone_s", self.out_zone_s),
+            ("zone_dmg", self.zone_dmg),
+            ("take_failed", self.take_failed as f32),
+            ("took", self.took as f32),
+            ("dmg_taken", self.dmg_taken),
+            ("dmg_rear", self.dmg_rear),
+            ("los_s", self.los_s),
+            ("firing_s", self.firing_s),
+            ("engaged1_s", self.engaged_s[0]),
+            ("engaged2_s", self.engaged_s[1]),
+            ("engaged3_s", self.engaged_s[2]),
+            ("early_reloads", self.early_reloads as f32),
+            ("alive_s", self.alive_s),
+            ("unarmed_s", self.unarmed_s),
+            ("laser_s", self.laser_s),
+            ("laser_known_s", self.laser_known_s),
+        ]
+    }
+}
+
 pub struct Bot {
     pub cfg: Config,
     pub tune: Tuning,
@@ -261,8 +326,11 @@ pub struct Bot {
     last_t: f32,
     last_mode_log: f32,
     pub timing: Timing,
+    pub diag: Diag,
+    diag_mv: V2,
     pub debug: bool,
     pub verbose: bool,
+    verbose_every: i64,
 }
 
 impl Bot {
@@ -348,6 +416,9 @@ impl Bot {
             last_t: 0.0,
             last_mode_log: -1e9,
             timing: Timing::default(),
+            diag: Diag::default(),
+            diag_mv: [0.0, 0.0],
+            verbose_every: std::env::var("MECH_VERBOSE").ok().and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 1).unwrap_or(5),
             verbose: std::env::var("MECH_VERBOSE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
             debug: std::env::var("MECH_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
         }
@@ -421,6 +492,7 @@ impl Bot {
         let (take, drop) = self.loot_actions(&f, obs, &sit);
         let pick = self.pick_upgrade(&f, obs);
         self.last_aim = aim;
+        self.note_diag(&f, obs, &sit, &intent, mv, fire, reload);
         self.last_t = obs.t;
 
         let mut act = Action { tick: obs.tick as i64, mv, boost, jump, aim, fire, reload, pick, take, drop, debug: None };
@@ -429,6 +501,12 @@ impl Bot {
         }
         act.sanitize();
 
+        if self.verbose && !f.has(W_LASER) && (obs.t * 10.0).round() as i64 % 20 == 0 {
+            let why = self.explain_laser(&f, obs, &sit);
+            if !why.is_empty() {
+                eprintln!("[laser] t={:.0} {:?} task={:?}{}", obs.t, intent.mode, self.task.map(|k| k.kind), why);
+            }
+        }
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         let tm = &mut self.timing;
         tm.n += 1;
@@ -441,13 +519,14 @@ impl Bot {
             tm.over_20 += 1;
             eprintln!("[bot] slow decision {:.1} ms at t={:.1} mode={:?}", ms, obs.t, self.mode);
         }
-        if self.verbose && (obs.t * 10.0).round() as i64 % 5 == 0 {
+        if self.verbose && (obs.t * 10.0).round() as i64 % self.verbose_every == 0 {
             let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
             let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
             eprintln!(
-                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} retreat={} n={} dmg={:.0} {} [{}] rem={:.0}",
+                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} retreat={} n={} dmg={:.0} {} [{}] rem={:.0} task={}",
                 obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
-                self.retreating, sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining
+                self.retreating, sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining,
+                self.task.map(|k| format!("{:?}@({:.0},{:.0},{:.0}) s={:.2}", k.kind, k.pos[0], k.pos[1], k.pos[2], k.score)).unwrap_or_default()
             );
         }
         if obs.t - self.last_mode_log >= 10.0 {
@@ -459,6 +538,85 @@ impl Bot {
             );
         }
         act
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_diag(&mut self, f: &Frame, obs: &Obs, sit: &Sit, intent: &Intent, mv: V2, fire: [bool; 2], reload: bool) {
+        let dt = if self.timing.n == 0 { 0.0 } else { f.dt };
+        let need = if self.verbose { self.zone_need(f, obs) } else { 0 };
+        let recovering = self.mover.recovering(f.t);
+        let d = &mut self.diag;
+        d.mode_s[match intent.mode {
+            Mode::Final => 0,
+            Mode::Zone => 1,
+            Mode::Retreat => 2,
+            Mode::Fight => 3,
+            Mode::Loot => 4,
+            Mode::Hold => 5,
+        }] += dt;
+        let quiet = sit.n_engaged == 0 && self.model.dmg_recent < 20.0 && obs.projectiles.is_empty();
+        if quiet && len2(mv) > 0.5 && len2(self.diag_mv) > 0.5 && dot2(norm2(mv), norm2(self.diag_mv)) < -0.5 {
+            d.flips += 1;
+            if self.verbose {
+                eprintln!(
+                    "[flip] t={:.1} {:?} wary={} fight={} tgt={:?} retreat={} task={:?} explore={:?} need={} rem={:.0} recovering={}",
+                    f.t, intent.mode, sit.wary, sit.fight, sit.target.map(|x| (x.id, x.dist as i32, x.los)), self.retreating, self.task.map(|k| k.kind), self.explore.map(|e| (e.0[0] as i32, e.0[1] as i32)),
+                    need, intent.drive.remaining, recovering
+                );
+            }
+        }
+        self.diag_mv = mv;
+        let any_fire = fire[0] || fire[1];
+        let speed = f.vel[0].hypot(f.vel[1]);
+        if quiet && obs.me.grounded && speed < 1.0 && !any_fire && !intent.drive.waiting && !matches!(intent.mode, Mode::Final) && obs.me.hp >= obs.me.max_hp - 1.0 {
+            d.idle_s += dt;
+        }
+        if !obs.me.in_zone {
+            d.out_zone_s += dt;
+        }
+        for e in &obs.events {
+            match e.kind.as_str() {
+                "damaged" => {
+                    let a = e.amount.unwrap_or(0.0);
+                    if e.weapon.as_deref() == Some("zone") {
+                        d.zone_dmg += a;
+                    } else {
+                        d.dmg_taken += a;
+                        if e.rear == Some(true) {
+                            d.dmg_rear += a;
+                        }
+                    }
+                }
+                "take_failed" => d.take_failed += 1,
+                "took" => d.took += 1,
+                _ => {}
+            }
+        }
+        if sit.foes.iter().any(|x| x.los) {
+            d.los_s += dt;
+            if any_fire {
+                d.firing_s += dt;
+            }
+            if reload {
+                if let Some((_, g)) = f.slot(W_GUN) {
+                    if g.ammo > g.stats.mag * 0.25 {
+                        d.early_reloads += 1;
+                    }
+                }
+            }
+        }
+        if sit.n_engaged > 0 {
+            d.engaged_s[sit.n_engaged.min(3) - 1] += dt;
+        }
+        d.alive_s += dt;
+        if f.slots.iter().any(|s| s.is_none()) {
+            d.unarmed_s += dt;
+        }
+        if f.has(W_LASER) {
+            d.laser_s += dt;
+        } else if self.model.pickups.iter().any(|p| p.kind == "laser") {
+            d.laser_known_s += dt;
+        }
     }
 
     // ------------------------------------------------------------------ zone
@@ -823,7 +981,7 @@ impl Bot {
 
         // 5. Drift into the next circle early when nothing else is pressing.
         // 6. Loot, farm, supply drops.
-        if let Some(it) = self.plan_task(f, obs, sit, need == 1) {
+        if let Some(it) = self.plan_task(f, obs, sit) {
             return it;
         }
 

@@ -72,6 +72,8 @@ pub struct Pickup {
     pub kind: String,
     pub pos: V3,
     pub seen_t: f32,
+    /// Seconds it has been missing from the observations although we should see it.
+    pub missing: f32,
 }
 #[derive(Clone, Debug)]
 pub struct Crate {
@@ -79,12 +81,14 @@ pub struct Crate {
     pub pos: V3,
     pub hp: f32,
     pub seen_t: f32,
+    pub missing: f32,
 }
 #[derive(Clone, Debug)]
 pub struct Cube {
     pub id: i64,
     pub pos: V3,
     pub seen_t: f32,
+    pub missing: f32,
 }
 #[derive(Clone, Debug)]
 pub struct Heard {
@@ -120,7 +124,17 @@ pub struct Model {
     last_alive: i32,
     /// Last time the count of living mechs went down.
     pub death_t: f32,
+    /// Loot we stood in front of and did not see: (id, ignore re-sightings from afar until).
+    /// Without this a thing the server shows from far away but not from close by would
+    /// have us walk to it and away from it for ever.
+    pub ghosts: Vec<(i64, f32)>,
 }
+
+/// Seconds a remembered thing may be missing from view (while we should see it) before we forget it.
+const MISSING_S: f32 = 0.6;
+/// A forgotten thing is not believed again from further than this for a while.
+const GHOST_S: f32 = 30.0;
+const GHOST_TRUST_DIST: f32 = 25.0;
 
 impl Model {
     pub fn new() -> Model {
@@ -313,18 +327,48 @@ impl Model {
         });
 
         // ---- loot memory
+        // Things on the ground are only listed while we see them. A remembered thing is
+        // forgotten when it stays unlisted although we certainly should see it: close by
+        // (the proximity sensors look in every direction and through foliage) with a
+        // clear line - no building, no tree trunk - to its foot, middle and top.
         let near = (cfg.vision.near_range + me.stats.near_range_bonus) * 0.8;
-        let should_see = |p: V3| dist(p, eye) < near && world.los(eye, [p[0], p[1], p[2] + 1.0]);
+        let should_see = |p: V3, h: f32| {
+            dist(p, eye) < near && [0.2, 0.5 * h, h].iter().all(|dz| {
+                let q = [p[0], p[1], p[2] + dz];
+                world.los(eye, q) && !world.foliage(eye, q).0
+            })
+        };
+        self.ghosts.retain(|g| g.1 > t);
+        let ghosts = &mut self.ghosts;
+        let believe = |id: i64, p: V3, ghosts: &Vec<(i64, f32)>| !ghosts.iter().any(|g| g.0 == id) || dist(p, eye) < GHOST_TRUST_DIST;
+        let forget = |seen_t: f32, missing: &mut f32, id: i64, p: V3, h: f32, keep_s: f32, ghosts: &mut Vec<(i64, f32)>| -> bool {
+            if seen_t == t {
+                *missing = 0.0;
+                return true;
+            }
+            if t - seen_t > keep_s {
+                return false;
+            }
+            if should_see(p, h) {
+                *missing += dt;
+                if *missing > MISSING_S {
+                    ghosts.push((id, t + GHOST_S));
+                    return false;
+                }
+            }
+            true
+        };
         for p in &obs.pickups {
             match self.pickups.iter_mut().find(|x| x.id == p.id) {
                 Some(x) => {
                     x.pos = p.pos;
                     x.seen_t = t;
                 }
-                None => self.pickups.push(Pickup { id: p.id, kind: p.kind.clone(), pos: p.pos, seen_t: t }),
+                None if believe(p.id, p.pos, ghosts) => self.pickups.push(Pickup { id: p.id, kind: p.kind.clone(), pos: p.pos, seen_t: t, missing: 0.0 }),
+                None => {}
             }
         }
-        self.pickups.retain(|x| x.seen_t == t || (t - x.seen_t < 240.0 && !(t - x.seen_t > 0.25 && should_see(x.pos))));
+        self.pickups.retain_mut(|x| forget(x.seen_t, &mut x.missing, x.id, x.pos, 1.0, 240.0, ghosts));
         for c in &obs.crates {
             match self.crates.iter_mut().find(|x| x.id == c.id) {
                 Some(x) => {
@@ -332,20 +376,23 @@ impl Model {
                     x.hp = c.hp;
                     x.seen_t = t;
                 }
-                None => self.crates.push(Crate { id: c.id, pos: c.pos, hp: c.hp, seen_t: t }),
+                None if believe(c.id, c.pos, ghosts) => self.crates.push(Crate { id: c.id, pos: c.pos, hp: c.hp, seen_t: t, missing: 0.0 }),
+                None => {}
             }
         }
-        self.crates.retain(|x| x.seen_t == t || (t - x.seen_t < 240.0 && !(t - x.seen_t > 0.25 && should_see(x.pos))));
+        let crate_h = cfg.crates.height.max(0.5);
+        self.crates.retain_mut(|x| forget(x.seen_t, &mut x.missing, x.id, x.pos, crate_h, 240.0, ghosts));
         for c in &obs.cubes {
             match self.cubes.iter_mut().find(|x| x.id == c.id) {
                 Some(x) => {
                     x.pos = c.pos;
                     x.seen_t = t;
                 }
-                None => self.cubes.push(Cube { id: c.id, pos: c.pos, seen_t: t }),
+                None if believe(c.id, c.pos, ghosts) => self.cubes.push(Cube { id: c.id, pos: c.pos, seen_t: t, missing: 0.0 }),
+                None => {}
             }
         }
-        self.cubes.retain(|x| x.seen_t == t || (t - x.seen_t < 90.0 && !(t - x.seen_t > 0.25 && should_see(x.pos))));
+        self.cubes.retain_mut(|x| forget(x.seen_t, &mut x.missing, x.id, x.pos, 1.0, 90.0, ghosts));
 
         // ---- sounds
         for s in &obs.sounds {

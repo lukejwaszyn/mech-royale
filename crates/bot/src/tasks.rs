@@ -75,7 +75,7 @@ impl Bot {
     }
 
     /// Score of going to `pos` for `value`: value per second, or None if out of reach.
-    fn eval_task(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32, next_only: bool) -> Option<(f32, bool)> {
+    fn eval_task(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32) -> Option<(f32, bool)> {
         let d = dist2d(pos, f.pos);
         if d > self.tune.loot_range || value <= 0.0 {
             return None;
@@ -117,10 +117,26 @@ impl Bot {
         if !f.zone.inside_at(p2, f.t + time + 4.0, 6.0) {
             return None;
         }
-        if next_only && !f.zone.inside_next(p2, 5.0) {
+        // Outside the next circle: only while the closing circle is still well away from
+        // it when we get there. (Judged at the thing, never at where we stand: a rule
+        // that flips as we walk has us pacing up and down across the line.)
+        if !f.zone.inside_next(p2, 5.0) && f.zone.leaves_at(p2, 6.0).map_or(false, |tl| tl - f.t < time + self.tune.zone_margin_s) {
             return None;
         }
         Some((value / time, climb))
+    }
+
+    /// Debug aid: why are we not holding the laser we know about?
+    pub(crate) fn explain_laser(&self, f: &Frame, obs: &Obs, sit: &Sit) -> String {
+        let mut out = String::new();
+        for p in self.model.pickups.iter().filter(|p| p.kind == "laser") {
+            let (gain, _) = self.pickup_gain(f, sit, W_LASER);
+            let nav = self.nav(f.nav_idx);
+            let main = nav.nearest_node(p.pos).map(|n| nav.is_main(n));
+            let foe = sit.foes.iter().filter(|x| x.age < 20.0 && dist2d(x.pos, p.pos) < self.tune.avoid_range * 0.9).map(|x| x.id).collect::<Vec<_>>();
+            out += &format!(" [laser {} d={:.0} dz={:.0} gain={:.1} eval={:?} main={:?} foes_near={:?} bad={}]", p.id, dist2d(p.pos, f.pos), p.pos[2] - f.pos[2], gain, self.eval_task(f, obs, sit, p.pos, gain, 0.5), main, foe, self.model.bad_pickups.contains(&p.id));
+        }
+        out
     }
 
     fn task_valid(&self, task: &Task, obs: &Obs) -> bool {
@@ -133,7 +149,7 @@ impl Bot {
         }
     }
 
-    fn choose_task(&mut self, f: &Frame, obs: &Obs, sit: &Sit, next_only: bool) {
+    fn choose_task(&mut self, f: &Frame, obs: &Obs, sit: &Sit) {
         let t = f.t;
         let tune = &self.tune;
         let me = &obs.me;
@@ -159,23 +175,23 @@ impl Bot {
             }
             let (gain, _) = self.pickup_gain(f, sit, weapon_bit(&p.kind));
             if gain > 0.5 {
-                offer(TaskKind::Pickup(p.id), p.pos, self.eval_task(f, obs, sit, p.pos, gain, 0.5, next_only));
+                offer(TaskKind::Pickup(p.id), p.pos, self.eval_task(f, obs, sit, p.pos, gain, 0.5));
             }
         }
         if want_cubes {
             for c in &self.model.cubes {
-                offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, tune.v_cube, 0.0, next_only));
+                offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, tune.v_cube, 0.0));
             }
         }
         if farm_ok {
             let special_full = f.slots.iter().all(|s| s.is_some());
             for c in &self.model.crates {
                 let v = tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
-                offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0, next_only));
+                offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0));
             }
             if want_cubes {
                 for tr in self.model.tracks.iter().filter(|x| x.npc && t - x.seen_t < 4.0) {
-                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, tune.v_npc, tr.hp / gun_dps + 3.0, next_only));
+                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, tune.v_npc, tr.hp / gun_dps + 3.0));
                 }
             }
         }
@@ -184,7 +200,7 @@ impl Bot {
             let contested = sit.foes.iter().any(|x| x.age < 5.0 && dist2d(x.pos, d.pos) < 60.0);
             let v = tune.v_drop * (1.0 + (1.0 - f.hp_frac)) * if contested { 0.3 } else { 1.0 };
             let wait = (d.lands_in - travel).max(0.0) + d.capture_s;
-            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, sit, d.pos, v, wait, false));
+            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, sit, d.pos, v, wait));
         }
         if best.map(|b| b.kind) != self.task.map(|b| b.kind) {
             self.task_started = t;
@@ -193,7 +209,7 @@ impl Bot {
     }
 
     /// Movement for the current task, or None when there is nothing worth doing.
-    pub(crate) fn plan_task(&mut self, f: &Frame, obs: &Obs, sit: &Sit, next_only: bool) -> Option<Intent> {
+    pub(crate) fn plan_task(&mut self, f: &Frame, obs: &Obs, sit: &Sit) -> Option<Intent> {
         let t = f.t;
         let valid = self.task.map_or(false, |k| self.task_valid(&k, obs));
         if !valid || t - self.task_t > 0.5 {
@@ -201,7 +217,7 @@ impl Bot {
             if !valid {
                 self.task = None;
             }
-            self.choose_task(f, obs, sit, next_only);
+            self.choose_task(f, obs, sit);
         }
         let task = self.task?;
         // A task that drags on is out of reach in a way the map did not show: drop it for a while.

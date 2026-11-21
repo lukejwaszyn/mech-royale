@@ -132,6 +132,20 @@ impl Bot {
             tgt = None;
         }
         let unseen_attacker = t - self.model.last_hurt_t < 2.0 && self.model.last_hurt_by.map_or(true, |id| id < 100 && !sit.foes.iter().any(|x| x.id == id && x.age < 1.0));
+        // A drone that is shooting at us, when no mech can be shot right now: it is a
+        // few seconds of gun fire, it stops the damage (which also blocks regeneration)
+        // and it drops cubes. Ignoring drones let them kill a hiding bot.
+        if tgt.map_or(true, |x| !x.los) {
+            let drone = self
+                .model
+                .tracks
+                .iter()
+                .filter(|tr| tr.npc && tr.in_obs && tr.los && t - tr.hit_us_t < 4.0)
+                .min_by(|a, b| (a.hp + dist(a.pos, f.pos)).partial_cmp(&(b.hp + dist(b.pos, f.pos))).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(tr) = drone {
+                tgt = Some(self.tgt_of_track(tr));
+            }
+        }
         if tgt.is_none() && !unseen_attacker {
             match intent.farm {
                 Some(Farm::Npc(id)) => {

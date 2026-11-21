@@ -118,9 +118,9 @@ tuning! {
     scan_period_s = 4.0,
 
     // ---- loot priorities (value per item; divided by the time it costs)
-    w_laser = 10.0,
-    w_lightning = 8.5,
-    w_mortar = 3.5,
+    w_laser = 20.0,
+    w_lightning = 4.0,
+    w_mortar = 9.0,
     v_cube = 6.0,
     v_crate = 5.0,
     v_npc = 6.5,

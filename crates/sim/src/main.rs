@@ -70,6 +70,7 @@ SCRIPTED BOTS
   --squad-late-alive N ... or once this few mechs are left (default 6)
   --squad-deaths-per-hunter X   one more hunter per X dead members (default 1)
   --squad-omniscient   the squad always knows where the focus bot is
+  --focus-weapon KIND  experiment: the focus bot starts with a mortar, laser or lightning in slot 1
 
 EXAMPLES
   sim --bot "target/release/bot" --fill squad --seed 1 --matches 20
@@ -197,6 +198,10 @@ fn main() {
             "--squad-late-alive" => opts.squad_late_alive = num(&next(&mut i, a), a),
             "--squad-deaths-per-hunter" => opts.squad_deaths_per_hunter = num(&next(&mut i, a), a),
             "--squad-omniscient" => opts.squad_omniscient = true,
+            "--focus-weapon" => {
+                let k = next(&mut i, a);
+                opts.focus_weapon = Some(sim::config::WKind::from_name(&k).unwrap_or_else(|| die(&format!("unknown weapon `{k}`"))));
+            }
             _ => die(&format!("unknown option `{a}` (try --help)")),
         }
         i += 1;
@@ -254,6 +259,7 @@ fn main() {
     let mut from_weapon: std::collections::BTreeMap<String, f64> = Default::default();
     let mut killer_kind: std::collections::BTreeMap<String, usize> = Default::default();
     let mut dealt_weapon: std::collections::BTreeMap<String, f64> = Default::default();
+    let mut diag_sum: Vec<(&'static str, f64)> = Vec::new();
     let mut hunters_sum = 0usize;
     let (mut f_shots, mut f_hits, mut dealt_sum, mut taken_sum) = (0u64, 0u64, 0.0f64, 0.0f64);
     // With --jobs, worker threads (each with its own nav grid) play the matches and the
@@ -353,6 +359,15 @@ fn main() {
         for (w, x) in &f.dmg_by_weapon {
             *from_weapon.entry(w.to_string()).or_default() += *x as f64;
         }
+        for (k, v) in &f.diag {
+            match diag_sum.iter_mut().find(|(n, _)| n == k) {
+                Some((_, x)) => *x += *v as f64,
+                None => diag_sum.push((k, *v as f64)),
+            }
+        }
+        if detail && !quiet && !f.diag.is_empty() {
+            println!("    bot: {}", f.diag.iter().filter(|(_, v)| *v != 0.0).map(|(k, v)| format!("{k} {v:.0}")).collect::<Vec<_>>().join(" "));
+        }
         for (w, x) in &f.dealt_by_weapon {
             *dealt_weapon.entry(w.to_string()).or_default() += *x as f64;
         }
@@ -420,6 +435,9 @@ fn main() {
             f_shots as f64 / d,
             hunters_sum as f64 / d
         );
+        if !diag_sum.is_empty() {
+            println!("bot counters (per match): {}", diag_sum.iter().map(|(k, v)| format!("{k} {:.1}", v / d)).collect::<Vec<_>>().join(" "));
+        }
     }
     println!("note: this simulator is an approximation of the rules; these numbers do not predict the real leaderboard.");
     let mut any = false;
