@@ -244,6 +244,9 @@ pub struct Bot {
     pub(crate) last_aim: V2,
     pub(crate) scan_base: f32,
     pub(crate) mortar_aim_until: f32,
+    // exploring for loot: (goal, since) and where we have been
+    explore: Option<(V3, f32)>,
+    visited: Vec<V3>,
     // travel boost hysteresis
     boosting: bool,
     last_t: f32,
@@ -314,6 +317,8 @@ impl Bot {
             last_aim: [0.0, 0.0],
             scan_base: 0.0,
             mortar_aim_until: -1e9,
+            explore: None,
+            visited: Vec::new(),
             boosting: false,
             last_t: 0.0,
             last_mode_log: -1e9,
@@ -687,8 +692,42 @@ impl Bot {
             return it;
         }
 
-        // 7. Hold a spot inside the next circle.
-        let d = self.drive_to(f, obs, home, 3.0, false);
+        // 7. Nothing known worth doing. While healthy and still weak (no second weapon or
+        //    few cubes), walk around inside the next circle to find loot; otherwise hold
+        //    a spot near a wall inside the next circle.
+        let weak = f.slots.iter().any(|s| s.is_none()) || me.cubes < self.tune.explore_until_cubes;
+        let mut goal = home;
+        if need == 0 && weak && f.hp_frac >= self.tune.farm_min_hp && !sit.threat_near && self.tune.explore_until_cubes >= 0.0 {
+            let stale = self.explore.map_or(true, |(g, since)| dist2d(g, f.pos) < 6.0 || f.t - since > 25.0 || !z.inside_next([g[0], g[1]], 4.0));
+            if stale {
+                let nav = &self.navs[f.nav_idx].1;
+                let mut best: Option<(f32, V3)> = None;
+                for _ in 0..8 {
+                    let a = self.rng.range(-3.1416, 3.1416);
+                    let r = z.nr * 0.85 * self.rng.f().sqrt();
+                    if let Some(p) = nav.nearest_walkable(z.nc[0] + r * a.cos(), z.nc[1] + r * a.sin()) {
+                        let d = dist2d(p, f.pos);
+                        if !(40.0..=260.0).contains(&d) || !z.inside_next([p[0], p[1]], 6.0) {
+                            continue;
+                        }
+                        // prefer ground we have not walked yet, and not too far
+                        let seen = self.visited.iter().filter(|v| dist2d(**v, p) < 70.0).count() as f32;
+                        let s = seen * 60.0 + (d - 120.0).abs();
+                        if best.map_or(true, |(bs, _)| s < bs) {
+                            best = Some((s, p));
+                        }
+                    }
+                }
+                self.explore = best.map(|b| (b.1, f.t));
+                if self.visited.last().map_or(true, |v| dist2d(*v, f.pos) > 50.0) {
+                    self.visited.push(f.pos);
+                }
+            }
+            if let Some((g, _)) = self.explore {
+                goal = g;
+            }
+        }
+        let d = self.drive_to(f, obs, goal, 3.0, false);
         let mut it = Intent::new(if need == 1 { Mode::Zone } else { Mode::Hold }, d, 2.0);
         if under_fire {
             it.strafe = strafe_axis.map(|a| (a, 0.8));
@@ -750,9 +789,15 @@ impl Bot {
 
         let exposed = th.los;
         let strafe_axis = perp(norm2([th.pos[0] - f.xy[0], th.pos[1] - f.xy[1]]));
+        // Cornered: a close enemy with a clear shot and no cover right here. Running at the
+        // same speed never breaks its line of sight; shooting back is the better trade.
+        let cornered = exposed && th.dist < 45.0;
         match self.cover {
             Some(c) => {
                 let d = self.drive_to(f, obs, c, 1.0, false);
+                if cornered && d.remaining > 16.0 {
+                    return self.plan_fight(f, obs, sit, th);
+                }
                 let mut it = Intent::new(Mode::Retreat, d, 2.5);
                 it.boost = exposed && me.energy > 4.0 && d.remaining > 6.0;
                 it.no_charge = exposed;
@@ -763,6 +808,9 @@ impl Bot {
                 it
             }
             None => {
+                if cornered {
+                    return self.plan_fight(f, obs, sit, th);
+                }
                 // No cover in reach: run away from the threat, staying in the zone.
                 let home = self.home.unwrap_or(f.pos);
                 let away = norm2([f.xy[0] - th.pos[0], f.xy[1] - th.pos[1]]);
@@ -873,6 +921,16 @@ impl Bot {
             self.strafe_until = t + self.rng.range(self.tune.strafe_period_min, self.tune.strafe_period_max);
         }
 
+        // strafing into a wall: turn round at once
+        if let Some((axis, _)) = intent.strafe {
+            if me.grounded {
+                let s = self.strafe_sign;
+                let probe = [f.xy[0] + axis[0] * s * 5.0, f.xy[1] + axis[1] * s * 5.0];
+                if self.world.walk_clear(f.pos, probe, &f.slim, 3.0).is_none() {
+                    self.strafe_sign = -s;
+                }
+            }
+        }
         let shells = self.shell_impacts(f, obs);
         let has_threats = !obs.projectiles.is_empty();
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats;
@@ -927,8 +985,9 @@ impl Bot {
             }
         }
 
-        // stuck recovery
-        if let Some(r) = self.mover.unstick(me, cmd, false, t, f.dt, self.tune.stuck_time_s, &mut self.rng) {
+        // stuck recovery (only when we are trying to get somewhere, not while strafing on the spot)
+        let travelling = intent.base_w > 0.0 && len2(d.dir) > 0.5;
+        if let Some(r) = self.mover.unstick(me, cmd, !travelling, t, f.dt, self.tune.stuck_time_s, &mut self.rng) {
             return (r.dir, r.jet, r.jump);
         }
 

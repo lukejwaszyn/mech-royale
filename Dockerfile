@@ -18,11 +18,12 @@ ENV CARGO_PROFILE_RELEASE_STRIP=symbols \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
     CARGO_INCREMENTAL=0
 RUN cargo build --release -p bot --bin bot \
- && cp target/release/bot /bot \
- && (ldd /bot 2>&1 | grep -qiE 'static|not a dynamic' || (echo "bot is not statically linked" && exit 1))
+ && cp target/release/bot /bot
 
 FROM scratch
 COPY --from=build /bot /bot
+# Runs in the empty image: proves the binary is static and starts.
+RUN ["/bot", "--version"]
 # practice | ffa  (ffa = the final: free-for-all against other teams' bots)
 ENV MECH_MODE=practice
 USER 65534:65534

@@ -113,6 +113,9 @@ tuning! {
     max_cubes = 10.0,
     /// Highest roof (m above the ground) we climb for loot.
     max_loot_climb = 22.0,
+    /// With nothing else to do, walk around looking for loot until we have this many cubes
+    /// (and a second weapon). Negative = never explore.
+    explore_until_cubes = 6.0,
 }
 
 /// Upgrade preference (higher = pick first). Survivability first: max HP also counts in

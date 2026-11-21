@@ -2,6 +2,10 @@ fn main() {
     let mut tune = bot::Tuning::from_env();
     for a in std::env::args().skip(1) {
         match a.as_str() {
+            "--version" => {
+                eprintln!("bot {} (mechfight/1)", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "--ffa" => tune.apply_ffa(),
             "--practice" => tune = { let mut t = bot::Tuning::default(); t.ffa = false; t },
             other => {

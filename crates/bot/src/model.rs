@@ -97,11 +97,14 @@ pub struct Model {
     /// Pickup ids whose `take` failed for good.
     pub bad_pickups: Vec<i64>,
     pub last_took_t: f32,
+    last_alive: i32,
+    /// Last time the count of living mechs went down.
+    pub death_t: f32,
 }
 
 impl Model {
     pub fn new() -> Model {
-        Model { last_hurt_t: -1e9, last_combat_t: -1e9, last_took_t: -1e9, ..Default::default() }
+        Model { last_hurt_t: -1e9, last_combat_t: -1e9, last_took_t: -1e9, death_t: -1e9, last_alive: i32::MAX, ..Default::default() }
     }
 
     pub fn track(&self, id: i64) -> Option<&Track> {
@@ -184,6 +187,11 @@ impl Model {
         let decay = (-dt / 3.0).exp();
         self.dmg_recent *= decay;
         self.events(obs);
+        if obs.alive < self.last_alive && self.last_alive != i32::MAX {
+            self.death_t = t;
+        }
+        self.last_alive = obs.alive;
+        let someone_died = t - self.death_t < 0.6;
 
         let eye = [me.pos[0], me.pos[1], me.pos[2] + me.stats.eye_height];
         let muzzle = [me.pos[0], me.pos[1], me.pos[2] + me.stats.muzzle_height];
@@ -264,14 +272,15 @@ impl Model {
             }
         }
         // The server keeps listing a mech for memory_s after we lose sight of it. One that
-        // vanishes right after we had a clear line to it is dead. Stale tracks expire.
+        // vanishes right after we saw it, just as the alive count drops, is dead. Stale
+        // tracks expire.
         let memory = cfg.vision.memory_s;
         self.tracks.retain(|tr| {
             if tr.in_obs {
                 return true;
             }
             let gone_for = t - tr.seen_t;
-            if gone_for < 0.3 && tr.seen_t - tr.los_t < memory - 1.0 {
+            if !tr.npc && someone_died && gone_for < 0.3 && tr.seen_t - tr.los_t < memory - 1.0 {
                 return false; // died (or left for good): do not chase a ghost
             }
             gone_for < if tr.npc { 20.0 } else { 30.0 }

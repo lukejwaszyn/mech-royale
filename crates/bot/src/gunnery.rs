@@ -165,7 +165,7 @@ impl Bot {
                     let loaded = s.ammo > 0.0 && s.reload <= 0.0;
                     if tg.los && tg.live && sol.clear && sol.in_range && loaded {
                         gun_busy = true;
-                        if aim_settled(me.aim, sol.aim, sol.tol, st.turn_rate, st.pitch_rate, 0.05) {
+                        if aim_settled(me.aim, sol.aim, sol.tol, st.turn_rate, st.pitch_rate, 0.03) {
                             fire[i] = true;
                         }
                     }
@@ -182,7 +182,7 @@ impl Bot {
                 let in_range = d <= s.stats.range - 2.0;
                 let clear = tg.live && world.los(shooter, p);
                 let tol = aim_tolerance(tg.radius, tg.height * 0.5, d, tune.aim_tol_scale);
-                let on = aim_settled(me.aim, la, tol, st.turn_rate, st.pitch_rate, 0.04);
+                let on = aim_settled(me.aim, la, tol, st.turn_rate, st.pitch_rate, 0.03);
                 let charging = s.charge > 0.0;
                 let ready = s.cooldown <= 0.12;
                 // start charging on a visible target, or on a mech about to come round a corner
