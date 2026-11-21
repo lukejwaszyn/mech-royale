@@ -187,11 +187,21 @@ impl Bot {
         let gun_dps = f.slot(W_GUN).map_or(100.0, |(_, s)| s.stats.damage / s.stats.cooldown.max(0.05) * 0.75 * f.dmg_scale);
         let mut best: Option<Task> = None;
         let mut offer = |kind: TaskKind, pos: V3, r: Option<(f32, bool)>| {
+            // The task we are on is judged leniently (a mech drifting to just inside the
+            // keep-away distance of our goal must not send us back and forth).
+            let current = self.task.map_or(false, |c| c.kind == kind);
+            let r = if r.is_none() && current {
+                let prize = matches!(kind, TaskKind::Pickup(id) if self.model.pickups.iter().any(|p| p.id == id && p.kind == "laser"));
+                let (range, keep) = if prize { (tune.laser_range, tune.laser_keep) } else { (tune.loot_range, tune.avoid_range * 0.9) };
+                self.eval_task_in(f, obs, sit, pos, self.task.map_or(1.0, |c| c.score.max(0.05)), 0.0, range * 1.25, keep * 0.55).map(|(_, climb)| (self.task.map_or(0.1, |c| c.score / 1.35), climb))
+            } else {
+                r
+            };
             if let Some((score, climb)) = r {
                 if self.task_black.iter().any(|(k, _)| *k == kind) {
                     return;
                 }
-                let score = if self.task.map_or(false, |c| c.kind == kind) { score * 1.35 } else { score };
+                let score = if current { score * 1.35 } else { score };
                 if best.map_or(true, |b| score > b.score) {
                     best = Some(Task { kind, pos, score, climb });
                 }

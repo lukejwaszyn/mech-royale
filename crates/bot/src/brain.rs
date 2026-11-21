@@ -840,7 +840,9 @@ impl Bot {
                 && f.hp_frac >= tune.first_strike_hp
                 && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5);
             // No laser yet, and one lies within reach: fetch it before picking fights.
-            let fetch_first = tune.unarmed_strike_range > 0.0 && tg.dist > tune.unarmed_strike_range && self.wanted_laser(f, obs, &sit).is_some();
+            let fetch_first = !f.has(W_LASER)
+                && ((tune.unarmed_strike_range > 0.0 && tg.dist > tune.unarmed_strike_range && self.wanted_laser(f, obs, &sit).is_some())
+                    || (tune.no_laser_strike_range > 0.0 && tg.dist > tune.no_laser_strike_range));
             let commit = kill_shot || ((hunt || first_strike) && !fetch_first);
             if commit {
                 self.hunt_until = (tg.id, t + tune.hunt_commit_s);
@@ -1210,23 +1212,32 @@ impl Bot {
             return None;
         }
         let arc = self.cfg.weapons.get("lightning").range;
-        let ok = |p: V3| -> bool {
+        let ok = |p: V3, prize: bool| -> bool {
             if (p[2] - f.pos[2]).abs() > 4.0 || !f.zone.inside_at([p[0], p[1]], f.t + 6.0, 5.0) {
                 return false;
             }
             let near = dist2d(p, f.pos) < 15.0;
             sit.foes.iter().filter(|x| x.age < 6.0).all(|x| {
-                let mut keep = if x.weapons & W_LIGHTNING != 0 { arc + 20.0 } else { 55.0 };
+                let lightning = x.weapons & W_LIGHTNING != 0;
+                let mut keep = if lightning { arc + 20.0 } else { 55.0 };
                 if x.id == tg.id && !near {
                     keep = keep.max(0.6 * tg.dist.min(rmin));
+                }
+                if prize && !lightning {
+                    // The laser doubles our damage: fetch it unless it lies at an enemy's
+                    // feet or the enemy stands between us and it.
+                    keep = 22.0f32.min(dist2d(x.pos, f.pos) * 0.6);
+                    if dist2d(x.pos, p) + 8.0 < dist2d(p, f.pos) {
+                        return false;
+                    }
                 }
                 dist2d(x.pos, p) >= keep
             })
         };
         let mut best: Option<(f32, V3)> = None;
-        let mut offer = |value: f32, p: V3, limit: f32| {
+        let mut offer = |value: f32, p: V3, limit: f32, prize: bool| {
             let d = dist2d(p, f.pos);
-            if d <= limit && ok(p) {
+            if d <= limit && ok(p, prize) {
                 let score = value / (d + 12.0);
                 if best.map_or(true, |b| score > b.0) {
                     best = Some((score, p));
@@ -1240,14 +1251,14 @@ impl Bot {
             }
             let bit = weapon_bit(&p.kind);
             if bit == W_LASER && !f.has(W_LASER) {
-                offer(self.tune.w_laser, p.pos, reach);
+                offer(self.tune.w_laser, p.pos, reach, true);
             } else if empty && !f.has(bit) && bit != 0 {
-                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3);
+                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3, false);
             }
         }
         if obs.me.cubes < self.tune.max_cubes {
             for c in &self.model.cubes {
-                offer(self.tune.v_cube, c.pos, reach * 0.25);
+                offer(self.tune.v_cube, c.pos, reach * 0.25, false);
             }
         }
         best.map(|b| b.1)
@@ -1383,6 +1394,13 @@ impl Bot {
             }
         }
         let arc_close = arcs.iter().any(|a| a.1 < arc_r + 8.0);
+        // Mechs other than the one we fight: do not walk (kite, strafe, dodge) into them.
+        let mut others: Vec<(V2, f32)> = Vec::new();
+        if self.tune.crowd_avoid > 0.0 && (intent.strafe.is_some() || intent.away.is_some()) {
+            for foe in sit.foes.iter().filter(|x| x.age < 8.0 && x.dist < 150.0 && Some(x.id) != sit.target.map(|g| g.id)) {
+                others.push((norm2([foe.pos[0] - f.xy[0], foe.pos[1] - f.xy[1]]), self.tune.crowd_avoid * (1.0 - foe.dist / 150.0)));
+            }
+        }
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
         let mut cmd = d.dir;
         if !plain && me.grounded {
@@ -1423,6 +1441,12 @@ impl Bot {
                 }
                 if has_threats {
                     s -= self.tune.dodge_weight * incoming_hits(f, obs, c, speed, accel, &shells, &self.cfg);
+                }
+                for (dir, w) in &others {
+                    let a = dot2(c, *dir);
+                    if a > 0.0 {
+                        s -= w * a;
+                    }
                 }
                 for (p, _) in &arcs {
                     // distance to the carrier one second from now if we walk this way

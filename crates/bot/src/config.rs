@@ -95,6 +95,8 @@ tuning! {
     tuck_reload_dist = 14.0,
     /// Weight of staying out of the arc of lightning carriers (0 = off).
     arc_avoid = 3.0,
+    /// Weight of not walking towards mechs other than our target while fighting (0 = off).
+    crowd_avoid = 2.0,
     strafe_period_min = 0.45,
     strafe_period_max = 1.25,
     /// Weight of dodging visible projectiles against following the path.
@@ -144,6 +146,9 @@ tuning! {
     /// While we hold no laser and know where one lies: start no fight with a mech
     /// further away than this (0 = start fights as usual).
     unarmed_strike_range = 60.0,
+    /// While we hold no laser at all: start no fight with a mech further away than this
+    /// (0 = no such limit). A gun duel takes twice as long and draws others in.
+    no_laser_strike_range = 0.0,
     /// During a fight, walk to a wanted laser within this distance if that does not
     /// take us towards the enemy (0 = off); cubes and other wanted weapons within a quarter of it.
     errand_range = 180.0,
