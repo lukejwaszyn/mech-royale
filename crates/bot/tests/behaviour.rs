@@ -241,3 +241,41 @@ fn does_not_run_from_a_single_attacker_when_hurt() {
     assert!(fired);
     assert!(!s.bot.as_ref().unwrap().retreating);
 }
+
+/// Shot in the back by a mech we have never seen while shooting at another one: the
+/// bot turns to the bearing of the hits (it used to keep its back to the attacker until
+/// it died, every hit a rear hit), and when the attacker comes into view it counts as
+/// an attacker from the first moment.
+#[test]
+fn turns_to_an_attacker_it_cannot_see() {
+    let mut s = session(Tuning::default());
+    // a bystander ahead (east) that we are shooting at: it walks at us
+    let ahead = |k: u32| json!([mech(7, [HERE[0] + 100.0 - k as f32 * 0.5, HERE[1], 0.0], [-5.0, 0.0, 0.0], [3.14, 0.0], json!(["gun"]))]);
+    let mut aim = [0.0f32, 0.0];
+    for k in 0..10 {
+        let a = step(&mut s, &obs(k, HERE, aim, json!([gun(), null]), json!({"mechs": ahead(k)})));
+        aim = [a["aim"][0].as_f64().unwrap() as f32, a["aim"][1].as_f64().unwrap() as f32];
+    }
+    assert!(aim[0].abs() < 0.3, "aiming at the mech ahead, got yaw {}", aim[0]);
+    // hits from due west (bearing pi) by mech 9, which is not listed
+    let hit = json!([{"type": "damaged", "amount": 68, "weapon": "gun", "bearing": 3.1, "by": 9, "rear": true}]);
+    let mut yaw = aim[0];
+    for k in 10..22 {
+        let a = step(&mut s, &obs(k, HERE, [yaw, 0.0], json!([gun(), null]), json!({"mechs": ahead(k), "events": hit})));
+        let want = a["aim"][0].as_f64().unwrap() as f32;
+        // the torso slews at 4 rad/s
+        let d = (want - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        yaw += d.clamp(-0.4, 0.4);
+    }
+    let off = (yaw - 3.1 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    assert!(off.abs() < 0.4, "the torso turned to the unseen attacker, yaw {yaw}");
+    // now it is in view: an attacker at once, and the target
+    let both = json!([
+        mech(7, [HERE[0] + 89.0, HERE[1], 0.0], [-5.0, 0.0, 0.0], [3.14, 0.0], json!(["gun"])),
+        mech(9, [HERE[0] - 70.0, HERE[1], 0.0], [0.0, 0.0, 0.0], [0.0, 0.0], json!(["gun"]))
+    ]);
+    step(&mut s, &obs(22, HERE, [yaw, 0.0], json!([gun(), null]), json!({"mechs": both})));
+    let bot = s.bot.as_ref().unwrap();
+    assert!(bot.model.track(9).unwrap().hit_us_t > 2.0, "the new track carries the hits it dealt unseen");
+    assert_eq!(bot.target, Some(9), "the mech that is hitting us is the target");
+}

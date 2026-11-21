@@ -104,6 +104,16 @@ tuning! {
     wall_penalty = 5.0,
     strafe_period_min = 0.45,
     strafe_period_max = 1.25,
+    /// Target inside our minimum range: weights of backing off and of jinking sideways
+    /// (deep = closer than 80% of the minimum range).
+    kite_deep_away = 2.2,
+    kite_deep_strafe = 0.4,
+    kite_away = 1.4,
+    kite_strafe = 0.7,
+    /// Boost away from a target closer than this (0 = only from lightning carriers),
+    /// starting with at least `kite_boost_start` energy.
+    kite_boost_dist = 90.0,
+    kite_boost_start = 35.0,
     /// Weight of dodging visible projectiles against following the path.
     dodge_weight = 4.0,
     strafe_weight = 1.0,
@@ -135,6 +145,9 @@ tuning! {
     /// Keep this much energy when firing lightning (unless the target is nearly dead).
     lightning_reserve = 8.0,
     scan_period_s = 4.0,
+    /// Turn to a mech that shoots us from out of view once its recent damage on us
+    /// (3 s decay) reaches this (0 = never turn away from the current target).
+    blind_turn_dmg = 40.0,
 
     // ---- loot priorities (value per item; divided by the time it costs)
     w_laser = 40.0,
@@ -170,6 +183,8 @@ tuning! {
     /// During a fight, walk to a wanted laser within this distance if that does not
     /// take us towards the enemy (0 = off); cubes and other wanted weapons within a quarter of it.
     errand_range = 180.0,
+    /// ... cubes within this fraction of `errand_range`.
+    errand_cube_frac = 0.25,
     /// Shooting crates and drones resets regeneration: only above this HP fraction.
     farm_min_hp = 0.8,
     /// Cubes stop adding HP and damage at the stat cap but keep growing the mech: stop collecting here.

@@ -169,6 +169,9 @@ pub struct Sit {
     pub fight: bool,
     /// Enemies are around that we neither fight nor are attacked by: stay out of sight.
     pub wary: bool,
+    /// A mech is hitting us that the server does not list to us (behind us, never seen):
+    /// (id, bearing its shots come from, its recent damage on us).
+    pub blind: Option<(i64, f32, f32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,6 +244,22 @@ pub struct Diag {
     pub laser_s: f32,
     /// Seconds without a laser while we knew where one lies.
     pub laser_known_s: f32,
+    /// Weapon damage from mechs the server was not listing to us when they hit (never
+    /// seen, or out of view for longer than the server's memory).
+    pub dmg_blind: f32,
+    /// Weapon damage from mechs other than the one our guns were on.
+    pub dmg_offtarget: f32,
+    /// Cubes held at the end.
+    pub cubes: f32,
+    /// Weapon damage from mechs by their distance when they hit: < 60 m, < 110, < 160, further.
+    pub dmg_by_dist: [f32; 4],
+    /// Seconds with the target (in a clear line) at those distances.
+    pub tgt_dist_s: [f32; 4],
+    /// Seconds with the target in a clear line closer than 60 m, by what the legs were
+    /// doing: 0 other, 1 laser run, 2 errand, 3 split cover, 4 tuck, 5 kite, 6 zone, 7 loot/hold.
+    pub close_s: [f32; 8],
+    /// Seconds with boost held.
+    pub boost_s: f32,
 }
 
 impl Diag {
@@ -272,6 +291,25 @@ impl Diag {
             ("unarmed_s", self.unarmed_s),
             ("laser_s", self.laser_s),
             ("laser_known_s", self.laser_known_s),
+            ("dmg_blind", self.dmg_blind),
+            ("dmg_offtarget", self.dmg_offtarget),
+            ("cubes", self.cubes),
+            ("dmg_d60", self.dmg_by_dist[0]),
+            ("dmg_d110", self.dmg_by_dist[1]),
+            ("dmg_d160", self.dmg_by_dist[2]),
+            ("dmg_far", self.dmg_by_dist[3]),
+            ("tgt_d60_s", self.tgt_dist_s[0]),
+            ("tgt_d110_s", self.tgt_dist_s[1]),
+            ("tgt_d160_s", self.tgt_dist_s[2]),
+            ("tgt_far_s", self.tgt_dist_s[3]),
+            ("close_other", self.close_s[0]),
+            ("close_laserrun", self.close_s[1]),
+            ("close_errand", self.close_s[2]),
+            ("close_tuck", self.close_s[4]),
+            ("close_kite", self.close_s[5]),
+            ("close_zone", self.close_s[6]),
+            ("close_loothold", self.close_s[7]),
+            ("boost_s", self.boost_s),
         ]
     }
 }
@@ -328,11 +366,18 @@ pub struct Bot {
     pub(crate) last_aim: V2,
     pub(crate) scan_base: f32,
     pub(crate) mortar_aim_until: f32,
+    /// Facing a mech that shoots us unseen: (its id, last time we were not facing its
+    /// bearing, do not stare again before).
+    pub(crate) blind_face: (i64, f32, f32),
     // exploring for loot: (goal, since) and where we have been
     explore: Option<(V3, f32)>,
     visited: Vec<V3>,
     // travel boost hysteresis
     boosting: bool,
+    /// Boosting away from a close enemy (hysteresis on distance and energy).
+    kite_boost: bool,
+    /// Diagnostics: which branch of `plan_fight` moved the legs.
+    fight_kind: u8,
     last_t: f32,
     last_mode_log: f32,
     pub timing: Timing,
@@ -425,9 +470,12 @@ impl Bot {
             last_aim: [0.0, 0.0],
             scan_base: 0.0,
             mortar_aim_until: -1e9,
+            blind_face: (-1, -1e9, -1e9),
             explore: None,
             visited: Vec::new(),
             boosting: false,
+            kite_boost: false,
+            fight_kind: 0,
             last_t: 0.0,
             last_mode_log: -1e9,
             timing: Timing::default(),
@@ -507,7 +555,7 @@ impl Bot {
         let (take, drop) = self.loot_actions(&f, obs, &sit);
         let pick = self.pick_upgrade(&f, obs);
         self.last_aim = aim;
-        self.note_diag(&f, obs, &sit, &intent, mv, fire, reload);
+        self.note_diag(&f, obs, &sit, &intent, mv, fire, reload, boost);
         self.last_t = obs.t;
 
         let mut act = Action { tick: obs.tick as i64, mv, boost, jump, aim, fire, reload, pick, take, drop, debug: None };
@@ -558,11 +606,14 @@ impl Bot {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn note_diag(&mut self, f: &Frame, obs: &Obs, sit: &Sit, intent: &Intent, mv: V2, fire: [bool; 2], reload: bool) {
+    fn note_diag(&mut self, f: &Frame, obs: &Obs, sit: &Sit, intent: &Intent, mv: V2, fire: [bool; 2], reload: bool, boost: bool) {
         let dt = if self.timing.n == 0 { 0.0 } else { f.dt };
         let need = if self.verbose { self.zone_need(f, obs) } else { 0 };
         let recovering = self.mover.recovering(f.t);
+        let shot_at = self.shot_at;
+        let fight_kind = self.fight_kind;
         let d = &mut self.diag;
+        d.cubes = obs.me.cubes;
         d.mode_s[match intent.mode {
             Mode::Final => 0,
             Mode::Zone => 1,
@@ -602,6 +653,18 @@ impl Bot {
                         if e.rear == Some(true) {
                             d.dmg_rear += a;
                         }
+                        if let Some(by) = e.by.filter(|id| *id < 100) {
+                            if !obs.mechs.iter().any(|m| m.id == by) {
+                                d.dmg_blind += a;
+                            }
+                            if shot_at != Some(by) {
+                                d.dmg_offtarget += a;
+                            }
+                            if let Some(m) = obs.mechs.iter().find(|m| m.id == by) {
+                                let dd = dist(m.pos, f.pos);
+                                d.dmg_by_dist[if dd < 60.0 { 0 } else if dd < 110.0 { 1 } else if dd < 160.0 { 2 } else { 3 }] += a;
+                            }
+                        }
                     }
                 }
                 "take_failed" => d.take_failed += 1,
@@ -625,7 +688,22 @@ impl Bot {
         if sit.n_engaged > 0 {
             d.engaged_s[sit.n_engaged.min(3) - 1] += dt;
         }
+        if let Some(tg) = sit.target.filter(|x| x.los && sit.fight) {
+            d.tgt_dist_s[if tg.dist < 60.0 { 0 } else if tg.dist < 110.0 { 1 } else if tg.dist < 160.0 { 2 } else { 3 }] += dt;
+            if tg.dist < 60.0 {
+                let k = match intent.mode {
+                    Mode::Fight => fight_kind as usize,
+                    Mode::Zone | Mode::Final => 6,
+                    Mode::Loot | Mode::Hold => 7,
+                    _ => 0,
+                };
+                d.close_s[k.min(7)] += dt;
+            }
+        }
         d.alive_s += dt;
+        if boost {
+            d.boost_s += dt;
+        }
         if f.slots.iter().any(|s| s.is_none()) {
             d.unarmed_s += dt;
         }
@@ -739,6 +817,14 @@ impl Bot {
             sit.foes.push(Foe { ti, id: tr.id, pos: tr.pos, dist: d, los: tr.los && age < 0.3, age, hp: tr.hp, hp_frac: if tr.max_hp > 0.0 { tr.hp / tr.max_hp } else { 1.0 }, engaged, weapons: tr.weapons, cubes: tr.cubes });
         }
         sit.n_engaged = sit.foes.iter().filter(|x| x.engaged).count();
+        // Hit by a mech we cannot place: all we have is the bearing of its shots.
+        sit.blind = self
+            .model
+            .attackers
+            .iter()
+            .filter(|a| t - a.t < 1.2 && a.bearing.is_some() && !self.model.tracks.iter().any(|tr| tr.id == a.id && tr.in_obs))
+            .max_by(|a, b| a.dmg.partial_cmp(&b.dmg).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|a| (a.id, a.bearing.unwrap_or(0.0), a.dmg));
         // duel clocks: time it spent shooting at us, time we spent shooting at it
         for foe in &sit.foes {
             let tr = &mut self.model.tracks[foe.ti];
@@ -1322,7 +1408,7 @@ impl Bot {
         }
         if obs.me.cubes < self.tune.max_cubes {
             for c in &self.model.cubes {
-                offer(self.tune.v_cube, c.pos, reach * 0.25, false);
+                offer(self.tune.v_cube, c.pos, reach * self.tune.errand_cube_frac, false);
             }
         }
         best.map(|b| b.1)
@@ -1337,13 +1423,16 @@ impl Bot {
         let sw = self.tune.strafe_weight;
         let has_lightning = f.has(W_LIGHTNING);
 
+        self.fight_kind = 0;
         if let Some((g, climb)) = self.laser_run(f, obs, sit) {
+            self.fight_kind = 1;
             let d = self.drive_to(f, obs, g, 0.4, climb);
             let mut it = Intent::new(Mode::Fight, d, 1.9);
             it.strafe = Some((side, 0.45 * sw));
             return it;
         }
         if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
+            self.fight_kind = 2;
             let d = self.drive_to(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
@@ -1419,6 +1508,7 @@ impl Bot {
                 }
                 if let Some((c, _)) = self.fight_cover {
                     if f.zone.inside_at([c[0], c[1]], t + 3.0, 4.0) {
+                        self.fight_kind = 4;
                         let d = self.drive_to(f, obs, c, 0.8, false);
                         let mut it = Intent::new(Mode::Fight, d, 2.2);
                         it.strafe = Some((side, 0.3 * sw));
@@ -1450,13 +1540,25 @@ impl Bot {
         let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
         it.strafe = Some((side, sw));
         if tg.dist < rmin {
+            self.fight_kind = 5;
             // kite: back off at full speed (the torso keeps facing and firing), harder the
             // deeper it is inside our minimum range
             let deep = tg.dist < rmin * 0.8;
-            it.away = Some(([-bearing[0], -bearing[1]], if deep { 2.2 } else { 1.4 }));
-            it.strafe = Some((side, if deep { 0.4 * sw } else { 0.7 * sw }));
+            let tn = &self.tune;
+            it.away = Some(([-bearing[0], -bearing[1]], if deep { tn.kite_deep_away } else { tn.kite_away }));
+            it.strafe = Some((side, if deep { tn.kite_deep_strafe * sw } else { tn.kite_strafe * sw }));
             let arc = if tg.weapons & W_LIGHTNING != 0 { self.cfg.weapons.get("lightning").range } else { 0.0 };
             it.boost = deep && arc > 0.0 && me.energy > 10.0;
+            // An enemy this close hits with everything, whoever pilots it. Legs are the
+            // same speed on both sides: only the boost opens the distance again.
+            if tn.kite_boost_dist > 0.0 {
+                if tg.dist < tn.kite_boost_dist && me.energy >= tn.kite_boost_start {
+                    self.kite_boost = true;
+                } else if tg.dist > tn.kite_boost_dist + 25.0 || me.energy < 6.0 {
+                    self.kite_boost = false;
+                }
+                it.boost = it.boost || self.kite_boost;
+            }
             // Charging the laser halves our speed. That only matters when the enemy must
             // be outrun: a lightning carrier about to get us inside its arc. Against
             // everything else the laser is most of our damage - keep it firing.
