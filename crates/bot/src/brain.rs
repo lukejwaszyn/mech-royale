@@ -1315,10 +1315,27 @@ impl Bot {
         }
         let shells = self.shell_impacts(f, obs);
         let has_threats = !obs.projectiles.is_empty();
-        let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats;
+        // Lightning never misses inside its range: stay out of the arc of every carrier
+        // we know of, whatever else the legs are doing (unless we are rushing it with our
+        // own lightning).
+        let rushing = f.has(W_LIGHTNING) && matches!(intent.mode, Mode::Fight);
+        let arc_r = self.cfg.weapons.get("lightning").range;
+        let mut arcs: Vec<(V2, f32)> = Vec::new();
+        if self.tune.arc_avoid > 0.0 && arc_r > 0.0 {
+            for foe in sit.foes.iter().filter(|x| x.weapons & W_LIGHTNING != 0 && x.age < 2.5 && x.dist < arc_r + 40.0) {
+                if rushing && Some(foe.id) == sit.target.map(|x| x.id) {
+                    continue;
+                }
+                // where it will be in half a second
+                let tr = &self.model.tracks[foe.ti];
+                arcs.push(([foe.pos[0] + tr.vel_s[0] * 0.5, foe.pos[1] + tr.vel_s[1] * 0.5], foe.dist));
+            }
+        }
+        let arc_close = arcs.iter().any(|a| a.1 < arc_r + 8.0);
+        let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
         let mut cmd = d.dir;
         if !plain && me.grounded {
-            let speed = if intent.boost { me.stats.boost_speed } else { me.stats.walk_speed };
+            let speed = if intent.boost || arc_close { me.stats.boost_speed } else { me.stats.walk_speed };
             let accel = me.stats.ground_accel.max(1.0);
             let world = &*self.world;
             let cur_dir = norm2([f.vel[0], f.vel[1]]);
@@ -1356,6 +1373,15 @@ impl Bot {
                 if has_threats {
                     s -= self.tune.dodge_weight * incoming_hits(f, obs, c, speed, accel, &shells, &self.cfg);
                 }
+                for (p, _) in &arcs {
+                    // distance to the carrier one second from now if we walk this way
+                    let q = [f.xy[0] + c[0] * speed, f.xy[1] + c[1] * speed];
+                    let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                    let safe = arc_r + 15.0;
+                    if d < safe {
+                        s -= self.tune.arc_avoid * (safe - d) / 15.0;
+                    }
+                }
                 if s > best.0 {
                     best = (s, c);
                 }
@@ -1382,7 +1408,7 @@ impl Bot {
         } else if me.energy >= self.tune.boost_travel_start.min(me.max_energy - 1.0) && d.remaining > 60.0 && !sit.threat_near {
             self.boosting = true;
         }
-        let boost = me.grounded && len2(cmd) > 0.3 && (intent.boost || self.boosting);
+        let boost = me.grounded && len2(cmd) > 0.3 && (intent.boost || self.boosting || (arc_close && me.energy > 4.0));
         (cmd, boost, false)
     }
 

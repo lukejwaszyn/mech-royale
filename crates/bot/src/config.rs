@@ -93,6 +93,8 @@ tuning! {
     cover_search = 70.0,
     /// Step behind cover while the gun reloads if cover is within this walking distance (0 = off).
     tuck_reload_dist = 14.0,
+    /// Weight of staying out of the arc of lightning carriers (0 = off).
+    arc_avoid = 3.0,
     strafe_period_min = 0.45,
     strafe_period_max = 1.25,
     /// Weight of dodging visible projectiles against following the path.
