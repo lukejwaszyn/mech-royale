@@ -42,7 +42,7 @@ match sandbox flags passes `check.py` with 300 of 300 answers in time.
 |---|---|
 | `MECH_MODE=ffa` or `--ffa` | free-for-all preset for the final (default: `practice`) |
 | `MECH_TUNE="key=value,..."` or `--tune=...` | override any field of `Tuning` (`crates/bot/src/config.rs`) |
-| `MECH_VERBOSE=1` | two state lines per match-second on stderr |
+| `MECH_VERBOSE=1` | two state lines per match-second on stderr (`MECH_VERBOSE=N`: one every N decisions), plus a line for every leg reversal while nobody shoots and for a known laser we do not hold |
 | `MECH_DEBUG=1` | attach debug drawings (path, target line, holding spot) to actions |
 
 Every behaviour number is a field of the one `Tuning` struct in `crates/bot/src/config.rs`
