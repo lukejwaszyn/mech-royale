@@ -114,6 +114,18 @@ tuning! {
     /// starting with at least `kite_boost_start` energy.
     kite_boost_dist = 90.0,
     kite_boost_start = 35.0,
+    /// A target we fight that is out of sight and closer than this: back away from it
+    /// instead of waiting where we stand (0 = wait).
+    blind_kite_dist = 0.0,
+    /// Boost on an errand (laser, cube) during a fight while the target is in sight
+    /// and closer than this (0 = walk).
+    errand_boost = 90.0,
+    /// While strafing or kiting: lean towards the inside of the next circle, with this
+    /// weight at its rim (0 inside 55% of its radius, more outside; 0 = off).
+    zone_pull = 0.0,
+    /// While strafing or kiting in a fight: cost of a step that loses the line of fire
+    /// to the target (0 = off).
+    los_keep = 3.0,
     /// Weight of dodging visible projectiles against following the path.
     dodge_weight = 4.0,
     strafe_weight = 1.0,
@@ -145,6 +157,9 @@ tuning! {
     /// Keep this much energy when firing lightning (unless the target is nearly dead).
     lightning_reserve = 8.0,
     scan_period_s = 4.0,
+    /// Start charging the laser at a target behind cover only if it was in our line of
+    /// fire within this many seconds.
+    precharge_s = 1000.0,
     /// Turn to a mech that shoots us from out of view once its recent damage on us
     /// (3 s decay) reaches this (0 = never turn away from the current target).
     blind_turn_dmg = 40.0,

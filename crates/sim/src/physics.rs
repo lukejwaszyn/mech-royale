@@ -322,7 +322,10 @@ fn vertical(w: &World, k: &mut Kin, p: &MoveParams, mv: V2, dt: f32, out: &mut M
             nz = (ceil - p.height).max(z);
             k.vel[2] = 0.0;
             if let Some(dir) = cdir {
-                slide(w, k, p, dir, mv);
+                // protocol.md §7: "unless a wall holds you under it, you are slid out from
+                // under it (up to 0.6 m per tick) and climb on" - whatever the legs do
+                // (only the roof-edge rule depends on walking towards the roof).
+                slide(w, k, p, dir, [0.0, 0.0]);
             }
         }
     }
@@ -389,6 +392,13 @@ pub fn step_kin(w: &World, k: &mut Kin, p: &MoveParams, inp: &MoveIn, energy: &m
     if *energy < 0.0 {
         *energy = 0.0;
     }
+    // Rising bodies go up before they go sideways: with the sideways move first, a jump
+    // taken while walking up a slope met "terrain higher than the feet" in its first
+    // tick and counted as a landing - no jump ever left rising ground.
+    let rising = !k.grounded && k.vel[2] > 0.0;
+    if rising {
+        vertical(w, k, p, mv, dt, &mut out);
+    }
     let (dx, dy) = (k.vel[0] * dt, k.vel[1] * dt);
     let d = (dx * dx + dy * dy).sqrt();
     let n = ((d / 0.5).ceil() as usize).clamp(1, 16);
@@ -397,6 +407,8 @@ pub fn step_kin(w: &World, k: &mut Kin, p: &MoveParams, inp: &MoveIn, energy: &m
             break;
         }
     }
-    vertical(w, k, p, mv, dt, &mut out);
+    if !rising {
+        vertical(w, k, p, mv, dt, &mut out);
+    }
     out
 }

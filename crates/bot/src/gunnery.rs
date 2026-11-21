@@ -24,6 +24,8 @@ pub struct Tgt {
     pub los: bool,
     /// Its position is current (listed by the server this tick).
     pub live: bool,
+    /// Last time we had a clear line of fire to it.
+    pub fire_los_t: f32,
 }
 
 /// Is the actual aim close enough to `want`, allowing for the slew that happens before
@@ -91,7 +93,7 @@ impl Bot {
             let s = 1.0 + c.cubes.size_per_cube * tr.cubes;
             (c.mech.height * s, c.mech.radius * s)
         };
-        Tgt { id: tr.id, feet: tr.pos, vel: tr.vel, vel_s: tr.vel_s, height, radius, hp: tr.hp, mech: !tr.npc, weapons: tr.weapons, los: tr.los, live: tr.in_obs }
+        Tgt { id: tr.id, feet: tr.pos, vel: tr.vel, vel_s: tr.vel_s, height, radius, hp: tr.hp, mech: !tr.npc, weapons: tr.weapons, los: tr.los, live: tr.in_obs, fire_los_t: tr.fire_los_t }
     }
 
     /// Returns (aim, fire, reload).
@@ -183,7 +185,7 @@ impl Bot {
                     if let Some(c) = self.model.crates.iter().find(|c| c.id == id) {
                         let cc = &self.cfg.crates;
                         let mid = [c.pos[0], c.pos[1], c.pos[2] + cc.height * 0.5];
-                        tgt = Some(Tgt { id, feet: c.pos, vel: [0.0; 3], vel_s: [0.0; 3], height: cc.height, radius: cc.radius, hp: c.hp, mech: false, weapons: 0, los: world.los(f.muzzle, mid), live: true });
+                        tgt = Some(Tgt { id, feet: c.pos, vel: [0.0; 3], vel_s: [0.0; 3], height: cc.height, radius: cc.radius, hp: c.hp, mech: false, weapons: 0, los: world.los(f.muzzle, mid), live: true, fire_los_t: t });
                     }
                 }
                 None => {}
@@ -231,7 +233,10 @@ impl Bot {
                 let charging = s.charge > 0.0;
                 let ready = s.cooldown <= 0.12;
                 // start charging on a visible target, or on a mech about to come round a corner
-                let start = ready && in_range && !intent.no_charge && (clear || (tg.mech && tg.live && d < 150.0 && !intent.hold_fire));
+                // (Only one we had in the line of fire a moment ago: charging halves our
+                // speed, and a charge held too long fires itself into the wall.)
+                let peeking = tg.mech && tg.live && d < 150.0 && !intent.hold_fire && t - tg.fire_los_t <= tune.precharge_s;
+                let start = ready && in_range && !intent.no_charge && (clear || peeking);
                 if charging || start {
                     let dmg_now = laser_damage(s.stats.damage, s.stats.min_frac, full, s.charge) * f.dmg_scale;
                     let kill_now = charging && clear && on && s.charge >= s.stats.min_charge && dmg_now >= tg.hp;

@@ -197,11 +197,13 @@ pub struct Intent {
     pub no_charge: bool,
     /// Hidden and regenerating: do not fire at things that cannot see us.
     pub hold_fire: bool,
+    /// Point (the target's middle) we want to keep in our line of fire while moving.
+    pub keep_los: Option<V3>,
 }
 
 impl Intent {
     pub fn new(mode: Mode, drive: Drive, base_w: f32) -> Intent {
-        Intent { mode, drive, base_w, strafe: None, away: None, boost: false, farm: None, no_charge: false, hold_fire: false }
+        Intent { mode, drive, base_w, strafe: None, away: None, boost: false, farm: None, no_charge: false, hold_fire: false, keep_los: None }
     }
 }
 
@@ -260,6 +262,14 @@ pub struct Diag {
     pub close_s: [f32; 8],
     /// Seconds with boost held.
     pub boost_s: f32,
+    /// Roof hops that did not arrive.
+    pub hop_fail: f32,
+    /// First contacts (a mech hits us or becomes our fight target for the first time)
+    /// by distance: < 60 m, < 110, < 160, further.
+    pub contact: [f32; 4],
+    /// First contacts closer than 60 m by what we were doing: fight, loot, hold, other.
+    pub contact_close: [f32; 4],
+    contacted: Vec<i64>,
 }
 
 impl Diag {
@@ -310,6 +320,15 @@ impl Diag {
             ("close_zone", self.close_s[6]),
             ("close_loothold", self.close_s[7]),
             ("boost_s", self.boost_s),
+            ("hop_fail", self.hop_fail),
+            ("contact_d60", self.contact[0]),
+            ("contact_d110", self.contact[1]),
+            ("contact_d160", self.contact[2]),
+            ("contact_far", self.contact[3]),
+            ("contact60_fight", self.contact_close[0]),
+            ("contact60_loot", self.contact_close[1]),
+            ("contact60_hold", self.contact_close[2]),
+            ("contact60_other", self.contact_close[3]),
         ]
     }
 }
@@ -378,6 +397,7 @@ pub struct Bot {
     kite_boost: bool,
     /// Diagnostics: which branch of `plan_fight` moved the legs.
     fight_kind: u8,
+    prev_mode: Mode,
     last_t: f32,
     last_mode_log: f32,
     pub timing: Timing,
@@ -476,6 +496,7 @@ impl Bot {
             boosting: false,
             kite_boost: false,
             fight_kind: 0,
+            prev_mode: Mode::Hold,
             last_t: 0.0,
             last_mode_log: -1e9,
             timing: Timing::default(),
@@ -612,8 +633,12 @@ impl Bot {
         let recovering = self.mover.recovering(f.t);
         let shot_at = self.shot_at;
         let fight_kind = self.fight_kind;
+        let prev_mode = self.prev_mode;
+        self.prev_mode = intent.mode;
+        let hop_fail = self.mover.hop_failures as f32;
         let d = &mut self.diag;
         d.cubes = obs.me.cubes;
+        d.hop_fail = hop_fail;
         d.mode_s[match intent.mode {
             Mode::Final => 0,
             Mode::Zone => 1,
@@ -687,6 +712,20 @@ impl Bot {
         }
         if sit.n_engaged > 0 {
             d.engaged_s[sit.n_engaged.min(3) - 1] += dt;
+        }
+        for foe in sit.foes.iter().filter(|x| x.engaged || (sit.fight && x.los && Some(x.id) == sit.target.map(|g| g.id))) {
+            if !d.contacted.contains(&foe.id) {
+                d.contacted.push(foe.id);
+                d.contact[if foe.dist < 60.0 { 0 } else if foe.dist < 110.0 { 1 } else if foe.dist < 160.0 { 2 } else { 3 }] += 1.0;
+                if foe.dist < 60.0 {
+                    d.contact_close[match prev_mode {
+                        Mode::Fight => 0,
+                        Mode::Loot => 1,
+                        Mode::Hold => 2,
+                        _ => 3,
+                    }] += 1.0;
+                }
+            }
         }
         if let Some(tg) = sit.target.filter(|x| x.los && sit.fight) {
             d.tgt_dist_s[if tg.dist < 60.0 { 0 } else if tg.dist < 110.0 { 1 } else if tg.dist < 160.0 { 2 } else { 3 }] += dt;
@@ -1424,11 +1463,14 @@ impl Bot {
         let has_lightning = f.has(W_LIGHTNING);
 
         self.fight_kind = 0;
+        // An errand under the guns of a close enemy is run, not walked.
+        let hurry = self.tune.errand_boost > 0.0 && tg.los && tg.dist < self.tune.errand_boost && me.energy > 12.0;
         if let Some((g, climb)) = self.laser_run(f, obs, sit) {
             self.fight_kind = 1;
             let d = self.drive_to(f, obs, g, 0.4, climb);
             let mut it = Intent::new(Mode::Fight, d, 1.9);
             it.strafe = Some((side, 0.45 * sw));
+            it.boost = hurry && d.remaining > 8.0;
             return it;
         }
         if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
@@ -1436,6 +1478,7 @@ impl Bot {
             let d = self.drive_to(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
+            it.boost = hurry && d.remaining > 8.0;
             return it;
         }
 
@@ -1520,6 +1563,18 @@ impl Bot {
 
         let chase = tg.hp_frac < self.tune.finish_hp && f.hp_frac > 0.35 && (tg.dist > rmax || !tg.los) && me.energy > 12.0;
         let close_in = false;
+        if !tg.los && tg.age < 4.0 && tg.dist < self.tune.blind_kite_dist && !chase && !has_lightning {
+            // It is close and behind something: do not wait for it at the corner (a
+            // fight at 50 m suits every gunner). Open the distance while it comes, and
+            // meet it at long range when it steps out.
+            self.fight_kind = 5;
+            let tn = &self.tune;
+            let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
+            it.away = Some(([-bearing[0], -bearing[1]], tn.kite_away));
+            it.strafe = Some((side, 0.3 * sw));
+            it.boost = tn.kite_boost_dist > 0.0 && tg.dist < tn.kite_boost_dist * 0.7 && me.energy > 50.0;
+            return it;
+        }
         if !tg.los {
             // Close in on where it is until we have a line of fire.
             let d = self.drive_to(f, obs, tg.pos, (rmin * 0.6).max(8.0), false);
@@ -1539,6 +1594,10 @@ impl Bot {
         }
         let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
         it.strafe = Some((side, sw));
+        // Backing off or jinking behind a corner (or back from a roof edge) breaks our
+        // own line of fire; the next step then walks out again, and so on for ever
+        // without a shot. Keep the target in the line of fire while we move.
+        it.keep_los = Some([tg.pos[0], tg.pos[1], tg.pos[2] + self.cfg.mech.height * 0.5]);
         if tg.dist < rmin {
             self.fight_kind = 5;
             // kite: back off at full speed (the torso keeps facing and firing), harder the
@@ -1630,6 +1689,17 @@ impl Bot {
             }
         }
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
+        // Fighting near the rim of the circle the zone is closing to (or outside it)
+        // ends with our back to the wall of the zone: while strafing and kiting, lean
+        // towards its inside, harder the further out we are.
+        let zone_pull: Option<(V2, f32)> = if self.tune.zone_pull > 0.0 && f.zone.nr > 30.0 && !matches!(intent.mode, Mode::Final | Mode::Zone) {
+            let to_c = [f.zone.nc[0] - f.xy[0], f.zone.nc[1] - f.xy[1]];
+            let dc = len2(to_c);
+            let k = ((dc - 0.55 * f.zone.nr) / (0.45 * f.zone.nr)).clamp(0.0, 1.6);
+            if k > 0.0 { Some((norm2(to_c), self.tune.zone_pull * k)) } else { None }
+        } else {
+            None
+        };
         let mut cmd = d.dir;
         if !plain && me.grounded {
             let speed = if intent.boost || arc_close { me.stats.boost_speed } else { me.stats.walk_speed };
@@ -1652,6 +1722,9 @@ impl Bot {
                 if let Some((dir, w)) = intent.away {
                     s += w * dot2(c, dir);
                 }
+                if let Some((dir, w)) = zone_pull {
+                    s += w * dot2(c, dir);
+                }
                 if k == n {
                     // standing still is only right when we have arrived and nothing is incoming
                     s -= if intent.strafe.is_some() || intent.away.is_some() { 0.6 } else { 0.0 };
@@ -1666,6 +1739,11 @@ impl Bot {
                         let far = [f.xy[0] + c[0] * 10.0, f.xy[1] + c[1] * 10.0];
                         if world.walk_clear(f.pos, far, &f.slim, 3.0).is_none() {
                             s -= 0.3 * self.tune.wall_penalty;
+                        }
+                    }
+                    if let Some(p) = intent.keep_los {
+                        if self.tune.los_keep > 0.0 && !world.los([probe[0], probe[1], f.muzzle[2]], p) {
+                            s -= self.tune.los_keep;
                         }
                     }
                     // do not dodge, kite or strafe out of the zone - nor to where the
