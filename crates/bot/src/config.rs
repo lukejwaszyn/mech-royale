@@ -38,16 +38,16 @@ tuning! {
     /// Do not walk further than this (straight line, m) to start a fight.
     hunt_range = 170.0,
     /// Below this HP fraction: break line of sight and regenerate.
-    retreat_hp = 0.42,
+    retreat_hp = 0.0,
     /// Retreat threshold when two or more enemies are shooting at us.
-    retreat_hp_outnumbered = 0.9,
+    retreat_hp_outnumbered = 0.0,
     /// Engaged by more than this many enemies: retreat whatever our HP.
-    max_enemies = 1.0,
+    max_enemies = 99.0,
     /// A target counts as alone when no other mech is within this distance of it (m).
     isolation_radius = 85.0,
     /// Duel estimate (our survival time / the target's): below this we break off even at
     /// high HP, above `press_margin` we keep fighting even at low HP.
-    flee_margin = 0.7,
+    flee_margin = 0.0,
     press_margin = 1.3,
     /// Start a fight with a healthy mech only if our power (cubes, second weapon) is at
     /// least this multiple of its power, or it has shown poor aim.
@@ -64,6 +64,14 @@ tuning! {
     engaged_memory_s = 4.0,
     /// Give up on a target we could not shoot for this long (s).
     target_patience_s = 14.0,
+    /// A mech in plain sight within this distance that a few hits will finish is always attacked (0 = off).
+    kill_shot_range = 160.0,
+    /// Practice mode: a mech that walks towards us or aims at us inside this distance is
+    /// attacked before it opens fire (0 = off), while our HP fraction is at least `first_strike_hp`.
+    first_strike_range = 130.0,
+    first_strike_hp = 0.5,
+    /// Having opened fire on a mech we stay on it at least this long (s).
+    hunt_commit_s = 6.0,
 
     // ---- ranges (m)
     range_gun_min = 70.0,
@@ -196,6 +204,8 @@ impl Tuning {
         self.retreat_hp = 0.55;
         self.retreat_hp_outnumbered = 0.9;
         self.max_enemies = 1.0;
+        self.flee_margin = 0.7;
+        self.first_strike_range = 0.0;
         self.reengage_hp = 0.92;
         self.range_gun_min = 80.0;
         self.range_gun_max = 135.0;

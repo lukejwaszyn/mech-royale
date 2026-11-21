@@ -307,6 +307,10 @@ pub struct Bot {
     stand_until: f32,
     /// The mech our guns were on last decision.
     pub(crate) shot_at: Option<i64>,
+    /// (mech id, time) until which we keep attacking a mech we chose to attack.
+    hunt_until: (i64, f32),
+    /// Hysteresis for keeping clear of mechs we are not fighting.
+    wary_on: bool,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -401,6 +405,8 @@ impl Bot {
             exposed_since: -1.0,
             stand_until: -1e9,
             shot_at: None,
+            hunt_until: (-1, -1e9),
+            wary_on: false,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -814,9 +820,39 @@ impl Bot {
                 && isolated
                 && tg.dist <= tune.hunt_range * tune.aggression.clamp(0.3, 1.0)
                 && ((weak && f.hp_frac >= tune.retreat_hp + 0.1) || (stronger && tg.los && f.hp_frac >= tune.hunt_min_hp && !tune.ffa));
-            sit.fight = tg.engaged || hunt;
+            // A kill within reach is a place gained whatever else is going on: a mech in
+            // plain sight that a few more hits will finish.
+            let burst = f.slots.iter().flatten().map(|s| match s.bit {
+                W_LASER if s.cooldown < 1.0 => s.stats.damage,
+                W_GUN => s.stats.damage * s.ammo.min(4.0),
+                _ => 0.0,
+            }).sum::<f32>() * f.dmg_scale;
+            let kill_shot = tune.kill_shot_range > 0.0 && tg.los && tg.dist <= tune.kill_shot_range && (tg.hp <= burst || tg.hp_frac < tune.finish_hp * 0.6);
+            // In the practice run every other mech is one squad that hunts us: one that
+            // walks up to us or lines us up is coming to shoot. Shoot first.
+            let closing = dot2([tr.vel_s[0], tr.vel_s[1]], norm2([f.xy[0] - tg.pos[0], f.xy[1] - tg.pos[1]]));
+            let to_us = (f.pos[1] - tg.pos[1]).atan2(f.pos[0] - tg.pos[0]);
+            let lined_up = tr.in_obs && ang_diff(tr.aim[0], to_us).abs() < 0.12;
+            let first_strike = !tune.ffa
+                && tune.first_strike_range > 0.0
+                && tg.los
+                && tg.dist <= tune.first_strike_range
+                && f.hp_frac >= tune.first_strike_hp
+                && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5);
+            let commit = hunt || kill_shot || first_strike;
+            if commit {
+                self.hunt_until = (tg.id, t + tune.hunt_commit_s);
+            }
+            // Once we have opened fire on a mech we stay on it for a while: a hunt that
+            // stops when a condition flickers has only made an enemy.
+            let committed = self.hunt_until.0 == tg.id && t < self.hunt_until.1 && tg.age < 3.0;
+            sit.fight = tg.engaged || commit || committed;
         }
-        sit.wary = !sit.fight && sit.foes.iter().any(|x| x.age < 10.0 && x.dist < tune.avoid_range);
+        // Keep clear of mechs we are not fighting, with hysteresis: a single threshold had
+        // us walking to and fro across it.
+        let wary_r = if self.wary_on { tune.avoid_range + 30.0 } else { tune.avoid_range };
+        self.wary_on = !sit.fight && sit.foes.iter().any(|x| x.age < 10.0 && x.dist < wary_r);
+        sit.wary = self.wary_on;
 
         // ---- whom to hide from / face: whoever hurts us most, else the nearest shooter, else the target
         sit.threat = sit
@@ -1231,8 +1267,12 @@ impl Bot {
             let deep = tg.dist < rmin * 0.8;
             it.away = Some(([-bearing[0], -bearing[1]], if deep { 2.2 } else { 1.4 }));
             it.strafe = Some((side, if deep { 0.4 * sw } else { 0.7 * sw }));
-            it.boost = deep && tg.weapons & W_LIGHTNING != 0 && me.energy > 10.0;
-            it.no_charge = deep;
+            let arc = if tg.weapons & W_LIGHTNING != 0 { self.cfg.weapons.get("lightning").range } else { 0.0 };
+            it.boost = deep && arc > 0.0 && me.energy > 10.0;
+            // Charging the laser halves our speed. That only matters when the enemy must
+            // be outrun: a lightning carrier about to get us inside its arc. Against
+            // everything else the laser is most of our damage - keep it firing.
+            it.no_charge = arc > 0.0 && tg.dist < arc + 10.0;
         } else if has_lightning {
             // keep pressing inside arc range
             it.away = Some((bearing, 0.3));
