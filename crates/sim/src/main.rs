@@ -16,6 +16,10 @@ USAGE
 BOTS (16 mechs; process bots first, the rest is filled)
   --bot CMD            add one process bot (a command line speaking mechfight/1; quote it)
   --bots N CMD         add N copies of a process bot
+  --inproc TUNE        add our own bot (crates/bot) in-process: no pipes, no timing checks, nav grids
+                       shared between matches - about ten times faster, for tuning runs. TUNE is a
+                       MECH_TUNE list (key=value,...; "" = defaults; ffa=1 = the free-for-all preset)
+  --inprocs N TUNE     add N of them
   --fill KIND          what pilots the remaining slots (default: squad)
                          squad   4 easy, 4 medium, 4 hard, 3 expert scripted bots acting as ONE team
                                  against the focus bot (shared vision, no friendly targeting,
@@ -31,6 +35,8 @@ MATCHES
   --matches N          number of matches, seeds S, S+1, ... (default 1)
   --seeds A,B,C        explicit seeds
   --max-t SEC          stop every match at this match time
+  --jobs N             play N matches at a time (default 1; use it with --inproc or scripted bots only,
+                       process bots would compete for the CPU and look late)
   --stop-when-focus-dies   end a match as soon as the focus bot is dead (faster)
 
 PROTOCOL / TIMING
@@ -48,6 +54,8 @@ OUTPUT
   --trace-scale PX     pixels per metre (default 1)
   --trace-crop         crop the image to the path and zoom in
   --all                print every bot's result per match, not only the focus bot
+  --detail             per match: who damaged the focus bot (H = a hunter at the end), by which weapon,
+                       and gun accuracy both ways; the summary adds the totals per opponent level
   --quiet              only the summary
 
 WORLD / RULES
@@ -96,7 +104,8 @@ fn with_seed(p: &Path, seed: u64, many: bool) -> PathBuf {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut procs: Vec<String> = Vec::new();
+    let mut procs: Vec<BotSpec> = Vec::new();
+    let mut jobs = 1usize;
     let mut fill = "squad".to_string();
     let mut focus = 0usize;
     let mut focus_level = 1usize;
@@ -111,6 +120,7 @@ fn main() {
     let mut trace: Option<PathBuf> = None;
     let mut all = false;
     let mut quiet = false;
+    let mut detail = false;
 
     let mut i = 0;
     let next = |i: &mut usize, what: &str| -> String {
@@ -128,12 +138,21 @@ fn main() {
                 print!("{HELP}");
                 return;
             }
-            "--bot" => procs.push(next(&mut i, a)),
+            "--bot" => procs.push(BotSpec::Process(next(&mut i, a))),
+            "--inproc" => procs.push(BotSpec::InProc(next(&mut i, a))),
+            "--inprocs" => {
+                let n: usize = num(&next(&mut i, a), a);
+                let tune = next(&mut i, a);
+                for _ in 0..n {
+                    procs.push(BotSpec::InProc(tune.clone()));
+                }
+            }
+            "--jobs" | "-j" => jobs = num::<usize>(&next(&mut i, a), a).max(1),
             "--bots" => {
                 let n: usize = num(&next(&mut i, a), a);
                 let cmd = next(&mut i, a);
                 for _ in 0..n {
-                    procs.push(cmd.clone());
+                    procs.push(BotSpec::Process(cmd.clone()));
                 }
             }
             "--fill" => fill = next(&mut i, a),
@@ -156,6 +175,7 @@ fn main() {
             "--trace-crop" => opts.trace_crop = true,
             "--replay-every" => opts.replay_every = num(&next(&mut i, a), a),
             "--all" => all = true,
+            "--detail" => detail = true,
             "--quiet" | "-q" => quiet = true,
             "--arena" => arena = PathBuf::from(next(&mut i, a)),
             "--map-dir" => map_dir = Some(next(&mut i, a)),
@@ -193,7 +213,7 @@ fn main() {
     if procs.len() > n {
         die(&format!("{} process bots but a match has {} mechs", procs.len(), n));
     }
-    let mut bots: Vec<BotSpec> = procs.iter().map(|c| BotSpec::Process(c.clone())).collect();
+    let mut bots: Vec<BotSpec> = procs.clone();
     if bots.is_empty() && matches!(fill.as_str(), "squad" | "mix") {
         bots.push(BotSpec::Scripted(focus_level));
     }
@@ -228,11 +248,61 @@ fn main() {
     let mut done = 0usize;
     let mut proto: Vec<Option<(String, ProtoStats)>> = vec![None; n];
     let mut causes: std::collections::BTreeMap<String, usize> = Default::default();
-    for &s in &seeds {
+    // statistics over all matches: damage the focus bot took per opponent kind and per weapon,
+    // gun bullets fired / hit by the focus bot, and per opponent kind (all their targets)
+    let mut from_kind: std::collections::BTreeMap<String, f64> = Default::default();
+    let mut from_weapon: std::collections::BTreeMap<String, f64> = Default::default();
+    let mut killer_kind: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut dealt_weapon: std::collections::BTreeMap<String, f64> = Default::default();
+    let mut hunters_sum = 0usize;
+    let (mut f_shots, mut f_hits, mut dealt_sum, mut taken_sum) = (0u64, 0u64, 0.0f64, 0.0f64);
+    // With --jobs, worker threads (each with its own nav grid) play the matches and the
+    // results are reported here in seed order.
+    let opts_for = |s: u64| {
         let mut o = opts.clone();
         o.replay = replay.as_ref().map(|p| with_seed(p, s, many));
         o.trace = trace.as_ref().map(|p| with_seed(p, s, many));
-        let res = match run_match(&env, &spec, &o, s) {
+        o
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<sim::runner::MatchResult, String>)>();
+    let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers = if jobs > 1 { jobs.min(seeds.len()) } else { 0 };
+    for _ in 0..workers {
+        let (tx, next_idx, seeds, spec) = (tx.clone(), next_idx.clone(), seeds.clone(), spec.clone());
+        let (world, cfg) = (env.world.clone(), env.cfg.clone());
+        let jobs_opts: Vec<RunOpts> = seeds.iter().map(|&s| opts_for(s)).collect();
+        std::thread::spawn(move || {
+            let env = Env::new(world, cfg);
+            loop {
+                let k = next_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if k >= seeds.len() {
+                    break;
+                }
+                if tx.send((k, run_match(&env, &spec, &jobs_opts[k], seeds[k]))).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut pending: std::collections::BTreeMap<usize, Result<sim::runner::MatchResult, String>> = Default::default();
+    for (k, &s) in seeds.iter().enumerate() {
+        let res = if workers == 0 {
+            run_match(&env, &spec, &opts_for(s), s)
+        } else {
+            loop {
+                if let Some(r) = pending.remove(&k) {
+                    break r;
+                }
+                match rx.recv() {
+                    Ok((i, r)) => {
+                        pending.insert(i, r);
+                    }
+                    Err(_) => break Err("a worker thread stopped".into()),
+                }
+            }
+        };
+        let res = match res {
             Ok(r) => r,
             Err(e) => die(&e),
         };
@@ -275,6 +345,42 @@ fn main() {
                 }
             }
         }
+        f_shots += f.gun_shots as u64;
+        f_hits += f.gun_hits as u64;
+        dealt_sum += f.dmg_dealt as f64;
+        taken_sum += f.dmg_taken as f64;
+        hunters_sum += res.bots.iter().filter(|b| b.hunter).count();
+        for (w, x) in &f.dmg_by_weapon {
+            *from_weapon.entry(w.to_string()).or_default() += *x as f64;
+        }
+        for (w, x) in &f.dealt_by_weapon {
+            *dealt_weapon.entry(w.to_string()).or_default() += *x as f64;
+        }
+        let mut parts: Vec<(f32, String)> = Vec::new();
+        for (slot, &x) in f.dmg_from.iter().enumerate() {
+            if x <= 0.0 {
+                continue;
+            }
+            if let Some(b) = res.bots.iter().find(|b| b.slot == slot) {
+                *from_kind.entry(if slot == f.slot { "self".to_string() } else { b.kind.clone() }).or_default() += x as f64;
+                parts.push((x, format!("{}{} {:.0}", b.name, if b.hunter { "(H)" } else { "" }, x)));
+            }
+        }
+        if let Some(by) = f.death.as_ref().and_then(|d| d.by) {
+            let k = res.bots.iter().find(|b| b.slot == by as usize).map(|b| b.kind.clone()).unwrap_or_else(|| "drone".into());
+            *killer_kind.entry(k).or_default() += 1;
+        }
+        if detail && !quiet {
+            parts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            println!(
+                "    hurt by: {} | weapons: {} | own gun {}/{} hit | hunters at the end: {}",
+                parts.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(", "),
+                f.dmg_by_weapon.iter().map(|(w, x)| format!("{w} {x:.0}")).collect::<Vec<_>>().join(" "),
+                f.gun_hits,
+                f.gun_shots,
+                res.bots.iter().filter(|b| b.hunter).count()
+            );
+        }
         for (bi, b) in res.bots.iter().enumerate() {
             if let Some(ps) = &b.proto {
                 match &mut proto[bi] {
@@ -288,6 +394,7 @@ fn main() {
         BotSpec::Process(c) => c.clone(),
         BotSpec::Scripted(l) => format!("scripted {}", LEVEL_NAMES[*l]),
         BotSpec::Idle => "idle".into(),
+        BotSpec::InProc(t) => format!("inproc {t}"),
     };
     println!(
         "summary: {} match(es), focus bot [{}] vs {}: mean(16-place) = {:.2}, mean kills {:.2}, mean survival {:.0}s; causes: {}",
@@ -299,6 +406,21 @@ fn main() {
         surv_sum / done.max(1) as f64,
         causes.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
     );
+    if detail {
+        let d = done.max(1) as f64;
+        println!(
+            "detail (per match): dealt {:.0} ({}), taken {:.0}; taken from {}; by weapon {}; killed by {}; own gun accuracy {:.0}% ({:.0} shots/match); hunters at the end {:.1}",
+            dealt_sum / d,
+            dealt_weapon.iter().map(|(k, v)| format!("{k} {:.0}", v / d)).collect::<Vec<_>>().join(" "),
+            taken_sum / d,
+            from_kind.iter().map(|(k, v)| format!("{k} {:.0}", v / d)).collect::<Vec<_>>().join(" "),
+            from_weapon.iter().map(|(k, v)| format!("{k} {:.0}", v / d)).collect::<Vec<_>>().join(" "),
+            killer_kind.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
+            100.0 * f_hits as f64 / f_shots.max(1) as f64,
+            f_shots as f64 / d,
+            hunters_sum as f64 / d
+        );
+    }
     println!("note: this simulator is an approximation of the rules; these numbers do not predict the real leaderboard.");
     let mut any = false;
     for (bi, p) in proto.iter().enumerate() {

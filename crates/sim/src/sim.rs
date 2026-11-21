@@ -109,6 +109,15 @@ pub struct Mech {
     pub step_timer: f32,
     pub dmg_dealt: f32,
     pub dmg_taken: f32,
+    /// Damage taken per attacking mech id (statistics only).
+    pub dmg_from: Vec<f32>,
+    /// Damage taken per weapon name (statistics only).
+    pub dmg_by_weapon: Vec<(&'static str, f32)>,
+    /// Gun bullets fired / gun bullets that hit a mech (statistics only).
+    pub gun_shots: u32,
+    pub gun_hits: u32,
+    /// Damage dealt to mechs per weapon name (statistics only).
+    pub dealt_by_weapon: Vec<(&'static str, f32)>,
 }
 
 impl Mech {
@@ -466,6 +475,11 @@ impl Sim {
             step_timer: 0.0,
             dmg_dealt: 0.0,
             dmg_taken: 0.0,
+            dmg_from: Vec::new(),
+            dmg_by_weapon: Vec::new(),
+            gun_shots: 0,
+            gun_hits: 0,
+            dealt_by_weapon: Vec::new(),
         };
         m.weapons[0] = Some(Weapon::new(WKind::Gun, m.wst.gun.mag.round() as u32));
         self.mechs.push(m);
@@ -965,6 +979,16 @@ impl Sim {
                 m.hp -= dealt;
                 m.last_combat_t = t;
                 m.dmg_taken += dealt;
+                if let Some(a) = attacker {
+                    if m.dmg_from.len() <= a {
+                        m.dmg_from.resize(a + 1, 0.0);
+                    }
+                    m.dmg_from[a] += dealt;
+                }
+                match m.dmg_by_weapon.iter_mut().find(|(w, _)| *w == weapon) {
+                    Some((_, x)) => *x += dealt,
+                    None => m.dmg_by_weapon.push((weapon, dealt)),
+                }
                 m.last_hurt = Some(Hurt { t, by, weapon, from });
                 if was > 0.0 && m.hp <= 0.0 {
                     m.killer = Some((weapon, by));
@@ -1031,6 +1055,15 @@ impl Sim {
                 am.last_combat_t = t;
             }
             am.dmg_dealt += dealt;
+            if matches!(tg, Tgt::Mech(_)) {
+                if weapon == "gun" {
+                    am.gun_hits += 1;
+                }
+                match am.dealt_by_weapon.iter_mut().find(|(w, _)| *w == weapon) {
+                    Some((_, x)) => *x += dealt,
+                    None => am.dealt_by_weapon.push((weapon, dealt)),
+                }
+            }
             if am.rec {
                 let mut ev = json!({"type":"hit","target":target_id,"amount":r2(dealt),"weapon":weapon});
                 if let Some(e) = effect {
@@ -1113,6 +1146,7 @@ impl Sim {
         let mult = self.dmg_mult(i);
         self.projs.push(Proj { id: self.next_proj, kind: PKind::Gun, owner: i as i32, pos: origin, vel: scale(dir, g.speed), left: g.range, damage: g.damage * mult, mult, mortar: None });
         self.next_proj += 1;
+        self.mechs[i].gun_shots += 1;
         self.sound("gun", base, Some(i));
     }
 

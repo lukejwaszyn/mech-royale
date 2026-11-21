@@ -270,12 +270,12 @@ impl Bot {
     /// missing map the bot plays on a flat empty world (no walls known).
     pub fn new(hello: &Hello, tune: Tuning) -> Bot {
         let started = Instant::now();
-        let cfg = hello.config.clone();
+        let cfg = &hello.config;
         let (world, map_ok) = match World::load(std::path::Path::new(&hello.map.dir)) {
             Ok(w) => (w, true),
             Err(e) => {
                 eprintln!("[bot] map load failed ({e}); playing on a flat world");
-                (flat_world(&cfg), false)
+                (flat_world(cfg), false)
             }
         };
         let world = Arc::new(world);
@@ -293,6 +293,18 @@ impl Bot {
             navs.push((cubes, nav));
         }
         eprintln!("[bot] slot {} map_ok={} navs={} init {:.0} ms ffa={}", hello.slot, map_ok, navs.len(), started.elapsed().as_secs_f32() * 1000.0, tune.ffa);
+        Bot::with_parts(hello, tune, world, navs, map_ok)
+    }
+
+    /// The map and nav grids of a finished match, for [`Bot::with_parts`] (the local
+    /// simulator plays many matches in one process and the map never changes).
+    pub fn into_parts(self) -> (Arc<World>, Vec<(f32, Nav)>) {
+        (self.world, self.navs)
+    }
+
+    /// A bot on an already loaded map with already built nav grids (see [`Bot::new`]).
+    pub fn with_parts(hello: &Hello, tune: Tuning, world: Arc<World>, navs: Vec<(f32, Nav)>, map_ok: bool) -> Bot {
+        let cfg = hello.config.clone();
         Bot {
             cfg,
             tune,

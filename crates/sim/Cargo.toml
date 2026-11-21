@@ -6,6 +6,8 @@ description = "Rough local match simulator for mechfight/1 (an approximation - s
 
 [dependencies]
 world = { path = "../world" }
+# only for `--inproc`: our bot driven in-process (no pipes, shared nav grids) for fast tuning runs
+bot = { path = "../bot" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

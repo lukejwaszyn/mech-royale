@@ -19,6 +19,10 @@ pub enum BotSpec {
     Scripted(usize),
     /// Stands still.
     Idle,
+    /// Our own bot (`crates/bot`) driven in-process: same decisions, no pipes and no
+    /// timing checks, nav grids reused between matches. The string is a `MECH_TUNE`
+    /// style override list (`key=value,...`; `ffa=1` selects the free-for-all preset).
+    InProc(String),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +122,14 @@ pub struct BotResult {
     pub dmg_taken: f32,
     pub hp: f32,
     pub proto: Option<ProtoStats>,
+    /// Damage taken per attacking slot, and per weapon (zone and drones included).
+    pub dmg_from: Vec<f32>,
+    pub dmg_by_weapon: Vec<(&'static str, f32)>,
+    pub gun_shots: u32,
+    pub gun_hits: u32,
+    pub dealt_by_weapon: Vec<(&'static str, f32)>,
+    /// Was this bot one of the squad's hunters when the focus bot died (or the match ended)?
+    pub hunter: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +141,89 @@ pub struct MatchResult {
     pub wall_s: f64,
 }
 
+/// Our bot in-process. Observations and actions still go through JSON, so the bot sees
+/// exactly what the process version would parse.
+struct InProc {
+    bot: Option<bot::Bot>,
+    stats: ProtoStats,
+    last: Cmd,
+}
+
+thread_local! {
+    /// Maps and nav grids of finished in-process bots, ready for the next match.
+    static NAV_POOL: std::cell::RefCell<Vec<(Arc<World>, Vec<(f32, Nav)>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn inproc_tuning(over: &str) -> bot::Tuning {
+    let mut t = bot::Tuning::default();
+    if over.split(',').any(|p| matches!(p.trim(), "ffa=1" | "ffa")) {
+        t.apply_ffa();
+    }
+    for bad in t.apply_overrides(over) {
+        if bad != "ffa" {
+            eprintln!("sim: --inproc: ignored tuning `{bad}`");
+        }
+    }
+    t
+}
+
+impl InProc {
+    fn new(hello: &serde_json::Value, over: &str) -> InProc {
+        let hello: bot::proto::Hello = serde_json::from_value(hello.clone()).unwrap_or_default();
+        let tune = inproc_tuning(over);
+        let started = Instant::now();
+        let b = match NAV_POOL.with(|p| p.borrow_mut().pop()) {
+            Some((world, navs)) => bot::Bot::with_parts(&hello, tune, world, navs, true),
+            None => bot::Bot::new(&hello, tune),
+        };
+        let stats = ProtoStats { ready_ms: started.elapsed().as_secs_f64() * 1000.0, ..Default::default() };
+        InProc { bot: Some(b), stats, last: Cmd::default() }
+    }
+
+    fn decide(&mut self, obs: serde_json::Value) -> Cmd {
+        self.stats.sent += 1;
+        let started = Instant::now();
+        let cmd = (|| {
+            let o: bot::proto::Obs = serde_json::from_value(obs).ok()?;
+            let a = self.bot.as_mut()?.decide(&o);
+            let v = serde_json::to_value(&a).ok()?;
+            let (c, bad) = crate::proc::parse_action(&v);
+            if bad {
+                self.stats.bad_fields += 1;
+            }
+            Some(c)
+        })();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.stats.sum_ms += ms;
+        self.stats.max_ms = self.stats.max_ms.max(ms);
+        if ms > 10.0 {
+            self.stats.over_10ms += 1;
+        }
+        if ms > 20.0 {
+            self.stats.over_20ms += 1;
+        }
+        match cmd {
+            Some(c) => {
+                self.stats.answered += 1;
+                self.last = c.clone();
+                c
+            }
+            None => {
+                self.stats.bad_json += 1;
+                self.last.coast()
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(b) = self.bot.take() {
+            NAV_POOL.with(|p| p.borrow_mut().push(b.into_parts()));
+        }
+    }
+}
+
 enum Ctl {
+    InProc(Box<InProc>),
     Proc(Box<ProcBot>),
     Script(Box<Scripted>),
     Idle,
@@ -189,6 +283,15 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
                 names.push(format!("idle-{slot}"));
                 kinds.push("idle".into());
             }
+            BotSpec::InProc(over) => {
+                let hello = json!({"type":"hello","protocol":"mechfight/1","slot":slot,"seed":slot_seed(slot),
+                    "map":{"dir":opts.map_dir,"files":["v2/world.json","v2/terrain.i16"]},"config":cfg.raw});
+                let ip = InProc::new(&hello, over);
+                sim.mechs[slot].rec = true;
+                names.push(ip.bot.as_ref().map(|b| b.name().to_string()).unwrap_or_else(|| format!("inproc-{slot}")));
+                ctl.push(Ctl::InProc(Box::new(ip)));
+                kinds.push("inproc".into());
+            }
         }
     }
     for slot in 0..n {
@@ -232,6 +335,7 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
     let wait = if opts.enforce { budget } else { opts.wait_ms.max(budget) };
     let decide_dt = cfg.match_.decide_every as f32 / cfg.match_.tick_hz;
     let mut log_pos = 0usize;
+    let mut hunters_at_end: Vec<bool> = vec![false; n];
 
     loop {
         if sim.over() || opts.max_t.map_or(false, |m| sim.t >= m) || (opts.stop_when_focus_dies && !sim.mechs[focus_slot].alive) {
@@ -240,6 +344,9 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
         sim.update_vision();
         if let Some(s) = squad.as_mut() {
             s.update(&sim);
+            if sim.mechs[focus_slot].alive {
+                hunters_at_end = s.hunter.clone();
+            }
         }
         let tick = sim.tick;
         let t = sim.t;
@@ -297,6 +404,10 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
         for slot in 0..n {
             if !sim.mechs[slot].alive {
                 continue;
+            }
+            if let Ctl::InProc(ip) = &mut ctl[slot] {
+                let obs = sim.observe(slot);
+                cmds.push((slot, ip.decide(obs)));
             }
             if let Ctl::Script(b) = &mut ctl[slot] {
                 let sq = squad.as_ref().filter(|_| sim.mechs[slot].team == 1);
@@ -365,8 +476,15 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             hp: m.hp,
             proto: match &ctl[slot] {
                 Ctl::Proc(pb) => Some(pb.stats.clone()),
+                Ctl::InProc(ip) => Some(ip.stats.clone()),
                 _ => None,
             },
+            dmg_from: m.dmg_from.clone(),
+            dmg_by_weapon: m.dmg_by_weapon.clone(),
+            gun_shots: m.gun_shots,
+            gun_hits: m.gun_hits,
+            dealt_by_weapon: m.dealt_by_weapon.clone(),
+            hunter: hunters_at_end.get(slot).copied().unwrap_or(false),
         });
     }
     if let Some(w) = replay.as_mut() {
@@ -378,6 +496,11 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             "died_t": b.death.as_ref().map(|d| crate::util::r2(d.t)), "cause": b.death.as_ref().map(|d| d.cause), "by": b.death.as_ref().and_then(|d| d.by)})).collect();
         let _ = writeln!(w, "{}", json!({"type":"result","t": crate::util::r2(sim.t), "complete": complete, "bots": res}));
         let _ = w.flush();
+    }
+    for c in ctl.iter_mut() {
+        if let Ctl::InProc(ip) = c {
+            ip.release();
+        }
     }
     Ok(MatchResult { seed, bots, t_end: sim.t, wall_s: started.elapsed().as_secs_f64() })
 }
