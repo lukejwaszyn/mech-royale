@@ -262,6 +262,7 @@ fn main() {
     let mut diag_sum: Vec<(&'static str, f64)> = Vec::new();
     let mut hunters_sum = 0usize;
     let (mut f_shots, mut f_hits, mut dealt_sum, mut taken_sum) = (0u64, 0u64, 0.0f64, 0.0f64);
+    let mut wall_sum = 0.0f64;
     // With --jobs, worker threads (each with its own nav grid) play the matches and the
     // results are reported here in seed order.
     let opts_for = |s: u64| {
@@ -351,6 +352,7 @@ fn main() {
                 }
             }
         }
+        wall_sum += f.wall_s as f64;
         f_shots += f.gun_shots as u64;
         f_hits += f.gun_hits as u64;
         dealt_sum += f.dmg_dealt as f64;
@@ -424,7 +426,7 @@ fn main() {
     if detail {
         let d = done.max(1) as f64;
         println!(
-            "detail (per match): dealt {:.0} ({}), taken {:.0}; taken from {}; by weapon {}; killed by {}; own gun accuracy {:.0}% ({:.0} shots/match); hunters at the end {:.1}",
+            "detail (per match): dealt {:.0} ({}), taken {:.0}; taken from {}; by weapon {}; killed by {}; own gun accuracy {:.0}% ({:.0} shots/match); hunters at the end {:.1}; rubbing walls {:.1}s",
             dealt_sum / d,
             dealt_weapon.iter().map(|(k, v)| format!("{k} {:.0}", v / d)).collect::<Vec<_>>().join(" "),
             taken_sum / d,
@@ -433,7 +435,8 @@ fn main() {
             killer_kind.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
             100.0 * f_hits as f64 / f_shots.max(1) as f64,
             f_shots as f64 / d,
-            hunters_sum as f64 / d
+            hunters_sum as f64 / d,
+            wall_sum / d
         );
         if !diag_sum.is_empty() {
             println!("bot counters (per match): {}", diag_sum.iter().map(|(k, v)| format!("{k} {:.1}", v / d)).collect::<Vec<_>>().join(" "));

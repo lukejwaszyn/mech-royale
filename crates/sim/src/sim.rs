@@ -118,6 +118,8 @@ pub struct Mech {
     pub gun_hits: u32,
     /// Damage dealt to mechs per weapon name (statistics only).
     pub dealt_by_weapon: Vec<(&'static str, f32)>,
+    /// Ticks spent rubbing a wall or the map edge (statistics only).
+    pub wall_ticks: u32,
 }
 
 impl Mech {
@@ -480,6 +482,7 @@ impl Sim {
             gun_shots: 0,
             gun_hits: 0,
             dealt_by_weapon: Vec::new(),
+            wall_ticks: 0,
         };
         m.weapons[0] = Some(Weapon::new(WKind::Gun, m.wst.gun.mag.round() as u32));
         self.mechs.push(m);
@@ -1474,6 +1477,9 @@ impl Sim {
                 m.energy = (m.energy + st.energy_regen * dt).min(st.energy);
             }
             m.wall = out.wall || out.blocked;
+            if m.wall {
+                m.wall_ticks += 1;
+            }
             m.step_timer -= dt;
             let sp = m.kin.vel[0].hypot(m.kin.vel[1]);
             if m.step_timer <= 0.0 {

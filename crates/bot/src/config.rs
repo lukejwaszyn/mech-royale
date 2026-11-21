@@ -100,6 +100,8 @@ tuning! {
     arc_avoid = 3.0,
     /// Weight of not walking towards mechs other than our target while fighting (0 = off).
     crowd_avoid = 2.0,
+    /// Steering: cost of a step that runs into a wall or off a ledge.
+    wall_penalty = 5.0,
     strafe_period_min = 0.45,
     strafe_period_max = 1.25,
     /// Weight of dodging visible projectiles against following the path.

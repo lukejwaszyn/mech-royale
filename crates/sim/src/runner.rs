@@ -131,6 +131,8 @@ pub struct BotResult {
     pub gun_shots: u32,
     pub gun_hits: u32,
     pub dealt_by_weapon: Vec<(&'static str, f32)>,
+    /// Seconds spent rubbing a wall or the map edge.
+    pub wall_s: f32,
     /// The in-process bot's own counters (`bot::brain::Diag`).
     pub diag: Vec<(&'static str, f32)>,
     /// Was this bot one of the squad's hunters when the focus bot died (or the match ended)?
@@ -492,6 +494,7 @@ pub fn run_match(env: &Env, spec: &MatchSpec, opts: &RunOpts, seed: u64) -> Resu
             gun_shots: m.gun_shots,
             gun_hits: m.gun_hits,
             dealt_by_weapon: m.dealt_by_weapon.clone(),
+            wall_s: m.wall_ticks as f32 / cfg.match_.tick_hz as f32,
             diag: match &ctl[slot] {
                 Ctl::InProc(ip) => ip.bot.as_ref().map(|b| b.diag.list(b.mover.stuck_count)).unwrap_or_default(),
                 _ => Vec::new(),

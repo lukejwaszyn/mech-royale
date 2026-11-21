@@ -1525,9 +1525,16 @@ impl Bot {
                     s -= if intent.strafe.is_some() || intent.away.is_some() { 0.6 } else { 0.0 };
                 } else {
                     // walls and ledges
+                    // (a blocked step costs more than any pull: rubbing along a wall
+                    // makes us a standing target; a wall a second ahead costs a little)
                     let probe = [f.xy[0] + c[0] * 4.5, f.xy[1] + c[1] * 4.5];
                     if world.walk_clear(f.pos, probe, &f.slim, 3.0).is_none() {
-                        s -= 2.5;
+                        s -= self.tune.wall_penalty;
+                    } else {
+                        let far = [f.xy[0] + c[0] * 10.0, f.xy[1] + c[1] * 10.0];
+                        if world.walk_clear(f.pos, far, &f.slim, 3.0).is_none() {
+                            s -= 0.3 * self.tune.wall_penalty;
+                        }
                     }
                     // do not dodge, kite or strafe out of the zone - nor to where the
                     // closing circle will have passed in a few seconds
