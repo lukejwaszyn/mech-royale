@@ -57,9 +57,11 @@ tuning! {
     /// Keep fighting below `retreat_hp` while the only enemy has less than this x our HP.
     finish_ratio = 0.6,
     /// A target below this HP fraction is chased down (boost, close range) before it regenerates.
-    finish_hp = 0.4,
+    finish_hp = 0.3,
     /// Shot continuously for this long while retreating: stop running, fight the weakest.
     last_stand_s = 2.5,
+    /// A mech counts as attacking us for this long after its last hit on us (s).
+    engaged_memory_s = 4.0,
     /// Give up on a target we could not shoot for this long (s).
     target_patience_s = 14.0,
 
@@ -68,6 +70,8 @@ tuning! {
     range_gun_max = 120.0,
     /// With lightning (and energy) close to this distance.
     range_lightning = 28.0,
+    /// With lightning, rush a target only when it is already this close.
+    lightning_rush_dist = 65.0,
     /// Without lightning, stay at least this far from a lightning carrier.
     range_vs_lightning = 62.0,
     /// A mech known within this distance stops looting and farming.
@@ -117,7 +121,7 @@ tuning! {
     w_laser = 10.0,
     w_lightning = 8.5,
     w_mortar = 3.5,
-    v_cube = 4.0,
+    v_cube = 6.0,
     v_crate = 5.0,
     v_npc = 6.5,
     v_drop = 24.0,

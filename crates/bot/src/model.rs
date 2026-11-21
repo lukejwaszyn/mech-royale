@@ -48,7 +48,9 @@ pub struct Track {
     /// in the open in front of us. Their ratios measure how well each side shoots.
     pub dmg_us_total: f32,
     pub dmg_them_total: f32,
-    pub los_time: f32,
+    /// Seconds it spent shooting at us with a clear line / we spent shooting at it.
+    pub their_time: f32,
+    pub our_time: f32,
 }
 
 impl Track {
@@ -56,11 +58,11 @@ impl Track {
     /// more with a laser; the evidence takes over after a few seconds in the open).
     pub fn their_dps(&self) -> f32 {
         let prior = 85.0 + if self.weapons & W_LASER != 0 { 60.0 } else { 0.0 } + if self.weapons & W_LIGHTNING != 0 { 15.0 } else { 0.0 };
-        (self.dmg_us_total + prior * 3.0) / (self.los_time + 3.0)
+        (self.dmg_us_total + prior * 3.0) / (self.their_time + 3.0)
     }
     /// Our damage per second on it while we can see it (prior 85).
     pub fn our_dps(&self) -> f32 {
-        (self.dmg_them_total + 85.0 * 3.0) / (self.los_time + 3.0)
+        (self.dmg_them_total + 85.0 * 3.0) / (self.our_time + 3.0)
     }
 }
 
@@ -265,9 +267,6 @@ impl Model {
                     tr.seen_t = t;
                     tr.in_obs = true;
                     tr.los = los;
-                    if los && dist(a.pos, me.pos) < 240.0 {
-                        tr.los_time += dt;
-                    }
                     if eye_los {
                         tr.los_t = t;
                     }
@@ -293,7 +292,8 @@ impl Model {
                     we_hit_t: -1e9,
                     dmg_us_total: 0.0,
                     dmg_them_total: 0.0,
-                    los_time: 0.0,
+                    their_time: 0.0,
+                    our_time: 0.0,
                 }),
             }
         }

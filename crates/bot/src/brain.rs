@@ -240,6 +240,8 @@ pub struct Bot {
     strafe_until: f32,
     exposed_since: f32,
     stand_until: f32,
+    /// The mech our guns were on last decision.
+    pub(crate) shot_at: Option<i64>,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -318,6 +320,7 @@ impl Bot {
             strafe_until: -1e9,
             exposed_since: -1.0,
             stand_until: -1e9,
+            shot_at: None,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -541,11 +544,24 @@ impl Bot {
             let age = t - tr.seen_t;
             let d = dist(tr.pos, f.pos);
             let to_us = (f.pos[1] - tr.pos[1]).atan2(f.pos[0] - tr.pos[0]);
-            let aiming = tr.in_obs && tr.los && d < 170.0 && ang_diff(tr.aim[0], to_us).abs() < 0.25;
-            let engaged = age < 1.5 && (aiming || t - tr.hit_us_t < 3.0);
+            // "Engaged" = it is really attacking: it hit us in the last seconds, or it is
+            // charging a laser down our line. A mech that merely looks our way is not an
+            // enemy yet, and shooting it first would make it one.
+            let aiming = tr.in_obs && tr.los && d < 290.0 && ang_diff(tr.aim[0], to_us).abs() < 0.2;
+            let engaged = age < 1.5 && ((aiming && tr.charging) || t - tr.hit_us_t < tune.engaged_memory_s);
             sit.foes.push(Foe { ti, id: tr.id, pos: tr.pos, dist: d, los: tr.los && age < 0.3, age, hp: tr.hp, hp_frac: if tr.max_hp > 0.0 { tr.hp / tr.max_hp } else { 1.0 }, engaged, weapons: tr.weapons, cubes: tr.cubes });
         }
         sit.n_engaged = sit.foes.iter().filter(|x| x.engaged).count();
+        // duel clocks: time it spent shooting at us, time we spent shooting at it
+        for foe in &sit.foes {
+            let tr = &mut self.model.tracks[foe.ti];
+            if foe.engaged && foe.los {
+                tr.their_time += f.dt;
+            }
+            if self.shot_at == Some(foe.id) && foe.los {
+                tr.our_time += f.dt;
+            }
+        }
         sit.threat_near = sit.foes.iter().any(|x| x.age < 8.0 && x.dist < tune.threat_range && (x.los || x.engaged || x.dist < tune.avoid_range));
 
         // ---- target
@@ -559,7 +575,8 @@ impl Bot {
             }
             let mut s = 4.0 * (1.0 - foe.hp_frac) - foe.dist / 120.0 - 0.3 * foe.age;
             if foe.hp_frac < tune.finish_hp {
-                s += 2.0;
+                // a kill within reach beats answering a fresh attacker
+                s += 2.0 + 3.0 * (tune.finish_hp - foe.hp_frac) / tune.finish_hp.max(0.05);
             }
             if foe.los {
                 s += 1.5;
@@ -621,7 +638,7 @@ impl Bot {
             let mine = f.slots.iter().flatten().fold(0u8, |a, s| a | s.bit);
             let my_power = 1.0 + 0.08 * obs.me.cubes.min(tune.max_cubes) + special(mine);
             let its_power = 1.0 + 0.08 * tg.cubes.min(10.0) + special(tg.weapons);
-            let proven_poor = tr.los_time > 5.0 && tr.their_dps() < 45.0;
+            let proven_poor = tr.their_time > 5.0 && tr.their_dps() < 45.0;
             let stronger = my_power >= its_power * tune.hunt_power_ratio || proven_poor;
             let hunt = tune.aggression > 0.0
                 && isolated
@@ -698,7 +715,9 @@ impl Bot {
         // Lightning never misses inside its range, whoever pilots it: stay well outside
         // an enemy's arc unless we carry one too and have the HP to win the brawl.
         let arc_safe = tune.range_vs_lightning.max(self.cfg.weapons.get("lightning").range * 1.35);
-        if we_arc && (!they_arc || obs.me.hp > foe.hp * 1.15) {
+        // Only once it is close anyway (hunters come to us): crossing open ground to reach
+        // arc range costs more than the arc gives.
+        if we_arc && (foe.dist < tune.lightning_rush_dist || finish) && (!they_arc || obs.me.hp > foe.hp * 1.15) {
             let r = f.slot(W_LIGHTNING).map_or(45.0, |(_, s)| s.stats.range);
             return (10.0, tune.range_lightning.min(r * 0.8));
         }
@@ -777,6 +796,10 @@ impl Bot {
         // 4b. Enemies about that we do not want to fight (a group, or we are not healthy):
         //     get out of their sight and let whoever hunts us come round the corner alone.
         if sit.wary && need == 0 {
+            if let Some(g) = self.quick_grab(f, obs, sit, 70.0, 55.0) {
+                let d = self.drive_to(f, obs, g, 0.4, false);
+                return Intent::new(Mode::Loot, d, 2.0);
+            }
             let near = sit.foes.iter().filter(|x| x.age < 10.0).min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)).copied();
             if let Some(th) = near {
                 let mut it = self.plan_retreat(f, obs, sit, th, false);
@@ -838,6 +861,30 @@ impl Bot {
         it
     }
 
+    /// A cube (or a wanted weapon) close enough to grab without walking into anyone:
+    /// within `reach` of us and at least `clear` from every known mech.
+    fn quick_grab(&self, f: &Frame, obs: &Obs, sit: &Sit, reach: f32, clear: f32) -> Option<V3> {
+        let safe = |p: V3| !sit.foes.iter().any(|x| x.age < 8.0 && dist2d(x.pos, p) < clear) && f.zone.inside_at([p[0], p[1]], f.t + 4.0, 4.0) && (p[2] - f.pos[2]).abs() < 4.0;
+        let mut best: Option<(f32, V3)> = None;
+        if obs.me.cubes < self.tune.max_cubes {
+            for c in &self.model.cubes {
+                let d = dist2d(c.pos, f.pos);
+                if d < reach && safe(c.pos) && best.map_or(true, |b| d < b.0) {
+                    best = Some((d, c.pos));
+                }
+            }
+        }
+        if f.slots.iter().any(|s| s.is_none()) {
+            for p in &self.model.pickups {
+                let d = dist2d(p.pos, f.pos) + 10.0;
+                if d < reach && !f.has(weapon_bit(&p.kind)) && !self.model.bad_pickups.contains(&p.id) && safe(p.pos) && best.map_or(true, |b| d < b.0) {
+                    best = Some((d, p.pos));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     /// Get out of `th`'s sight (and stay out). `allow_stand`: turn and fight when cornered.
     fn plan_retreat(&mut self, f: &Frame, obs: &Obs, sit: &Sit, th: Foe, allow_stand: bool) -> Intent {
         let me = &obs.me;
@@ -850,14 +897,17 @@ impl Bot {
         let others: Vec<V3> = sit.foes.iter().filter(|x| x.id != th.id && x.age < 4.0 && x.dist < 250.0).map(muzzle_of).collect();
         let speed = me.stats.walk_speed.max(1.0);
 
+        // Cover the enemy can simply walk up to is no cover: keep a distance, and well
+        // outside the arc of a lightning carrier.
+        let keep = if th.weapons & W_LIGHTNING != 0 { self.cfg.weapons.get("lightning").range * 1.35 + 12.0 } else { 45.0 };
         let cover_bad = match self.cover {
-            Some(c) => !hidden_from(c, tm) || !f.zone.inside_at([c[0], c[1]], t + 4.0, 4.0),
+            Some(c) => !hidden_from(c, tm) || !f.zone.inside_at([c[0], c[1]], t + 4.0, 4.0) || (th.age < 3.0 && dist2d(c, th.pos) < keep),
             None => true,
         };
         if (cover_bad || t - self.cover_t > 1.0) && t - self.cover_t > 0.35 && f.can_plan() {
             self.cover_t = t;
             let nav = &self.navs[f.nav_idx].1;
-            let cands = nav.cover_points(f.pos, tm, self.tune.cover_search, h, 14);
+            let cands = nav.cover_points(f.pos, tm, self.tune.cover_search, h, 40);
             let bearing = norm2([th.pos[0] - f.xy[0], th.pos[1] - f.xy[1]]);
             let side = perp(bearing);
             let mut best: Option<(f32, V3)> = None;
@@ -867,6 +917,9 @@ impl Bot {
                     continue;
                 }
                 let mut s = c.path_dist - 0.35 * dist2d(p, th.pos);
+                if dist2d(p, th.pos) < keep + 8.0 {
+                    s += 80.0;
+                }
                 // Robust cover stays cover when the enemy sidesteps.
                 for sgn in [-1.0f32, 1.0] {
                     let shifted = [tm[0] + side[0] * 12.0 * sgn, tm[1] + side[1] * 12.0 * sgn, tm[2]];
@@ -973,7 +1026,7 @@ impl Bot {
         }
 
         let chase = tg.hp_frac < self.tune.finish_hp && f.hp_frac > 0.35 && (tg.dist > rmax || !tg.los) && me.energy > 12.0;
-        let close_in = has_lightning && tg.dist > rmax + 25.0 && me.energy > 60.0;
+        let close_in = false;
         if !tg.los {
             // Close in on where it is until we have a line of fire.
             let d = self.drive_to(f, obs, tg.pos, (rmin * 0.6).max(8.0), false);
@@ -993,6 +1046,15 @@ impl Bot {
         }
         let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
         it.strafe = Some((side, sw));
+        if tg.dist >= rmin {
+            // Cubes lying around (from the last kill): drift over them while we fight.
+            if let Some(g) = self.quick_grab(f, obs, sit, 45.0, rmin * 0.85) {
+                it.drive = self.drive_to(f, obs, g, 0.4, false);
+                it.base_w = 1.3;
+                it.strafe = Some((side, 0.5 * sw));
+                return it;
+            }
+        }
         if tg.dist < rmin {
             // kite: back off at full speed (the torso keeps facing and firing), harder the
             // deeper it is inside our minimum range

@@ -152,6 +152,8 @@ impl Bot {
             }
         }
 
+        self.shot_at = tgt.filter(|x| x.mech && x.los).map(|x| x.id);
+
         // ---- solutions per weapon
         let mut aim = self.look(f, obs, sit, mv, unseen_attacker);
         let mut reload = false;
