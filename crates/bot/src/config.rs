@@ -128,7 +128,7 @@ tuning! {
     scan_period_s = 4.0,
 
     // ---- loot priorities (value per item; divided by the time it costs)
-    w_laser = 20.0,
+    w_laser = 40.0,
     w_lightning = 4.0,
     w_mortar = 9.0,
     v_cube = 6.0,
@@ -137,6 +137,16 @@ tuning! {
     v_drop = 24.0,
     /// Only consider loot within this straight-line distance (m).
     loot_range = 170.0,
+    /// ... but a laser, while we hold none, within this distance, keeping only this far
+    /// from mechs we are not fighting. (With a laser we kill about twice as fast.)
+    laser_range = 300.0,
+    laser_keep = 50.0,
+    /// While we hold no laser and know where one lies: start no fight with a mech
+    /// further away than this (0 = start fights as usual).
+    unarmed_strike_range = 60.0,
+    /// During a fight, walk to a wanted laser within this distance if that does not
+    /// take us towards the enemy (0 = off); cubes and other wanted weapons within a quarter of it.
+    errand_range = 180.0,
     /// Shooting crates and drones resets regeneration: only above this HP fraction.
     farm_min_hp = 0.8,
     /// Cubes stop adding HP and damage at the stat cap but keep growing the mech: stop collecting here.

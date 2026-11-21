@@ -76,13 +76,20 @@ impl Bot {
 
     /// Score of going to `pos` for `value`: value per second, or None if out of reach.
     fn eval_task(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32) -> Option<(f32, bool)> {
+        self.eval_task_in(f, obs, sit, pos, value, extra_s, self.tune.loot_range, self.tune.avoid_range * 0.9)
+    }
+
+    /// As [`Self::eval_task`], with the search radius and the distance to keep from
+    /// mechs we are not fighting given explicitly (a laser is worth a longer, bolder trip).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_task_in(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32, range: f32, keep: f32) -> Option<(f32, bool)> {
         let d = dist2d(pos, f.pos);
-        if d > self.tune.loot_range || value <= 0.0 {
+        if d > range || value <= 0.0 {
             return None;
         }
         // not next to a mech we are not fighting
         let fighting = if sit.fight { sit.target.map(|x| x.id) } else { None };
-        if d > 12.0 && sit.foes.iter().any(|x| x.age < 20.0 && Some(x.id) != fighting && dist2d(x.pos, pos) < self.tune.avoid_range * 0.9) {
+        if d > 12.0 && sit.foes.iter().any(|x| x.age < 20.0 && Some(x.id) != fighting && dist2d(x.pos, pos) < keep) {
             return None;
         }
         let me = &obs.me;
@@ -124,6 +131,27 @@ impl Bot {
             return None;
         }
         Some((value / time, climb))
+    }
+
+    /// The laser lying on the ground that we want and can go for (we hold none): its
+    /// place and whether it needs a climb.
+    pub(crate) fn wanted_laser(&self, f: &Frame, obs: &Obs, sit: &Sit) -> Option<(V3, bool)> {
+        if f.has(W_LASER) {
+            return None;
+        }
+        let (gain, _) = self.pickup_gain(f, sit, W_LASER);
+        if gain <= 0.5 {
+            return None;
+        }
+        let mut best: Option<(f32, V3, bool)> = None;
+        for p in self.model.pickups.iter().filter(|p| p.kind == "laser" && !self.model.bad_pickups.contains(&p.id)) {
+            if let Some((score, climb)) = self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, self.tune.laser_range, self.tune.laser_keep) {
+                if best.map_or(true, |b| score > b.0) {
+                    best = Some((score, p.pos, climb));
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
     }
 
     /// Debug aid: why are we not holding the laser we know about?
@@ -175,7 +203,8 @@ impl Bot {
             }
             let (gain, _) = self.pickup_gain(f, sit, weapon_bit(&p.kind));
             if gain > 0.5 {
-                offer(TaskKind::Pickup(p.id), p.pos, self.eval_task(f, obs, sit, p.pos, gain, 0.5));
+                let r = if p.kind == "laser" { self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, tune.laser_range, tune.laser_keep) } else { self.eval_task(f, obs, sit, p.pos, gain, 0.5) };
+                offer(TaskKind::Pickup(p.id), p.pos, r);
             }
         }
         if want_cubes {

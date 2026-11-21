@@ -839,7 +839,9 @@ impl Bot {
                 && tg.dist <= tune.first_strike_range
                 && f.hp_frac >= tune.first_strike_hp
                 && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5);
-            let commit = hunt || kill_shot || first_strike;
+            // No laser yet, and one lies within reach: fetch it before picking fights.
+            let fetch_first = tune.unarmed_strike_range > 0.0 && tg.dist > tune.unarmed_strike_range && self.wanted_laser(f, obs, &sit).is_some();
+            let commit = kill_shot || ((hunt || first_strike) && !fetch_first);
             if commit {
                 self.hunt_until = (tg.id, t + tune.hunt_commit_s);
             }
@@ -1200,6 +1202,57 @@ impl Bot {
         }
     }
 
+    /// Something worth walking to while we fight `tg`: the laser we lack, a cube, a
+    /// weapon for an empty slot - if the way there does not lead towards any enemy.
+    fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<V3> {
+        let reach = self.tune.errand_range;
+        if reach <= 0.0 {
+            return None;
+        }
+        let arc = self.cfg.weapons.get("lightning").range;
+        let ok = |p: V3| -> bool {
+            if (p[2] - f.pos[2]).abs() > 4.0 || !f.zone.inside_at([p[0], p[1]], f.t + 6.0, 5.0) {
+                return false;
+            }
+            let near = dist2d(p, f.pos) < 15.0;
+            sit.foes.iter().filter(|x| x.age < 6.0).all(|x| {
+                let mut keep = if x.weapons & W_LIGHTNING != 0 { arc + 20.0 } else { 55.0 };
+                if x.id == tg.id && !near {
+                    keep = keep.max(0.6 * tg.dist.min(rmin));
+                }
+                dist2d(x.pos, p) >= keep
+            })
+        };
+        let mut best: Option<(f32, V3)> = None;
+        let mut offer = |value: f32, p: V3, limit: f32| {
+            let d = dist2d(p, f.pos);
+            if d <= limit && ok(p) {
+                let score = value / (d + 12.0);
+                if best.map_or(true, |b| score > b.0) {
+                    best = Some((score, p));
+                }
+            }
+        };
+        let empty = f.slots.iter().any(|s| s.is_none());
+        for p in &self.model.pickups {
+            if self.model.bad_pickups.contains(&p.id) {
+                continue;
+            }
+            let bit = weapon_bit(&p.kind);
+            if bit == W_LASER && !f.has(W_LASER) {
+                offer(self.tune.w_laser, p.pos, reach);
+            } else if empty && !f.has(bit) && bit != 0 {
+                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3);
+            }
+        }
+        if obs.me.cubes < self.tune.max_cubes {
+            for c in &self.model.cubes {
+                offer(self.tune.v_cube, c.pos, reach * 0.25);
+            }
+        }
+        best.map(|b| b.1)
+    }
+
     fn plan_fight(&mut self, f: &Frame, obs: &Obs, sit: &Sit, tg: Foe) -> Intent {
         let me = &obs.me;
         let t = f.t;
@@ -1208,6 +1261,13 @@ impl Bot {
         let side = perp(bearing);
         let sw = self.tune.strafe_weight;
         let has_lightning = f.has(W_LIGHTNING);
+
+        if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
+            let d = self.drive_to(f, obs, g, 0.4, false);
+            let mut it = Intent::new(Mode::Fight, d, 1.7);
+            it.strafe = Some((side, 0.5 * sw));
+            return it;
+        }
 
         // Step behind cover while the gun reloads (or the laser recovers and the gun is dry).
         if self.tune.tuck_reload_dist > 0.0 && tg.los {
@@ -1252,15 +1312,6 @@ impl Bot {
         }
         let mut it = Intent::new(Mode::Fight, Drive::default(), 0.0);
         it.strafe = Some((side, sw));
-        if tg.dist >= rmin {
-            // Cubes lying around (from the last kill): drift over them while we fight.
-            if let Some(g) = self.quick_grab(f, obs, sit, 45.0, rmin * 0.85) {
-                it.drive = self.drive_to(f, obs, g, 0.4, false);
-                it.base_w = 1.3;
-                it.strafe = Some((side, 0.5 * sw));
-                return it;
-            }
-        }
         if tg.dist < rmin {
             // kite: back off at full speed (the torso keeps facing and firing), harder the
             // deeper it is inside our minimum range
