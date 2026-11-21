@@ -1,0 +1,14 @@
+[package]
+name = "sim"
+edition.workspace = true
+version.workspace = true
+description = "Rough local match simulator for mechfight/1 (an approximation - see README.md)"
+
+[dependencies]
+world = { path = "../world" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
