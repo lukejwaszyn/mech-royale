@@ -64,6 +64,8 @@ pub struct Mover {
     /// stuck recovery (jump, sidestep, jump and jet) gets a turn.
     exit_fails: u32,
     exit_pause_until: f32,
+    /// Waiting for jet energy at an access: (its ground point, since, give up at, last seen waiting).
+    wait: Option<(V3, f32, f32, f32)>,
 }
 
 /// Failed hops after which an access is given up.
@@ -119,7 +121,9 @@ impl Mover {
         if std::env::var("MECH_VERBOSE").is_ok() {
             crate::vlogln!("[hop-fail] up={} from=({:.1},{:.1},{:.1}) to=({:.1},{:.1},{:.1}) crest={:.1} ended at=({:.1},{:.1},{:.1}) grounded={} e={:.0} left_ground={} need_jump={}", h.up, h.from[0], h.from[1], h.from[2], h.to[0], h.to[1], h.to[2], h.crest, me.pos[0], me.pos[1], me.pos[2], me.grounded, me.energy, h.left_ground, h.need_jump);
         }
-        let key = h.ground;
+        self.fail_access(h.ground);
+    }
+    fn fail_access(&mut self, key: V3) {
         match self.failed_hops.iter_mut().find(|(g, _)| dist2d(*g, key) < 1.0 && (g[2] - key[2]).abs() < 2.0) {
             Some((_, n)) => *n += 1,
             None => self.failed_hops.push((key, 1)),
@@ -224,8 +228,29 @@ impl Mover {
         let climb = if up { a.climb } else { a.climb_out };
         let need = if climb > me.stats.step_up { climb_energy(climb, jp) } else { 0.0 };
         if me.energy < need.min(me.max_energy - 1.0) {
-            return Drive { waiting: true, hard: true, remaining: d + climb, ..Default::default() };
+            // Wait for the energy - but not as a `hard` drive: the brain may strafe and
+            // dodge around this spot meanwhile (a mech standing still under fire at the
+            // foot of a wall is a free target), and not for ever: energy that does not
+            // come (lightning spends it as fast as it regenerates) counts as a failed hop.
+            let fresh = self.wait.map_or(true, |(g, _, _, last)| dist(g, a.ground) > 1.0 || t - last > 1.0 || t < last);
+            if fresh {
+                let lack = need.min(me.max_energy - 1.0) - me.energy;
+                self.wait = Some((a.ground, t, t + 3.0 + lack / 10.0, t));
+            }
+            if let Some(w) = self.wait.as_mut() {
+                w.3 = t;
+                if t > w.2 {
+                    self.wait = None;
+                    self.hop_failures += 1;
+                    self.fail_access(a.ground);
+                    if !up {
+                        self.exit_fails += 1;
+                    }
+                }
+            }
+            return Drive { waiting: true, remaining: d + climb, ..Default::default() };
         }
+        self.wait = None;
         self.hop = Some(Hop { to, crest: a.crest, t0: t, need_jump: climb > me.stats.step_up, jumped_t: -1e9, left_ground: false, span: dist2d(me.pos, to), from: me.pos, ground: a.ground, up });
         self.path.clear();
         self.do_hop(me, t).unwrap_or_default()
@@ -427,5 +452,35 @@ mod tests {
         let d = m.drive(&nav, &me, goal, 1.0, 3.1 + EXIT_PAUSE_S + 0.1, &jp, false, true);
         assert!(d.dir != [0.0, 0.0] || d.hard, "moving again: {d:?}");
         assert!(m.hopping() || dot2(d.dir, [1.0, 0.0]) < 0.999, "heading for an exit, not blindly at the goal: {d:?}");
+    }
+
+    /// Waiting for jet energy at the foot of a roof is not a `hard` drive (the brain may
+    /// strafe and dodge meanwhile), and energy that never comes ends the wait: it counts
+    /// as a failed hop, twice and the access is given up.
+    #[test]
+    fn waiting_for_energy_is_soft_and_times_out() {
+        let nav = roof_nav();
+        let roof = nav.regions().iter().find(|r| r.is_roof).unwrap().clone();
+        let a = roof.access[0];
+        let jp = JetParams::default();
+        let need = climb_energy(a.climb, &jp);
+        let mut me = SelfObs { pos: a.ground, energy: 5.0, ..Default::default() };
+        let mut m = Mover::new();
+        let d = m.drive(&nav, &me, a.top, 1.0, 0.0, &jp, true, true);
+        assert!(d.waiting && !d.hard && !m.hopping(), "waits, softly: {d:?}");
+        // energy arrives: the hop starts
+        me.energy = need + 5.0;
+        let d = m.drive(&nav, &me, a.top, 1.0, 0.5, &jp, true, true);
+        assert!(m.hopping() && d.hard && d.jump, "hops once the energy is there: {d:?}");
+        // energy never arrives: each wait ends as a failed hop, and the access is given up
+        let mut m = Mover::new();
+        me.energy = 5.0;
+        let mut t = 0.0;
+        while t < 40.0 && !m.access_bad(&a) {
+            m.drive(&nav, &me, a.top, 1.0, t, &jp, true, true);
+            t += 0.1;
+        }
+        assert!(m.access_bad(&a), "an access we cannot find the energy for is given up");
+        assert!(t > 6.0 && t < 30.0, "after a reasonable wait ({t:.1} s)");
     }
 }

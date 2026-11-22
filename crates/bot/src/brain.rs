@@ -1746,7 +1746,7 @@ impl Bot {
         let t = f.t;
         let d = intent.drive;
         if d.hard {
-            // hop or wait for energy: exact control
+            // hop or recovery: exact control
             let _ = self.mover.unstick(me, [0.0, 0.0], true, t, f.dt, self.tune.stuck_time_s, &mut self.rng);
             return (d.dir, d.jet, d.jump);
         }
@@ -1921,7 +1921,8 @@ impl Bot {
         } else if me.energy >= self.tune.boost_travel_start.min(me.max_energy - 1.0) && d.remaining > 60.0 && !sit.threat_near {
             self.boosting = true;
         }
-        let boost = me.grounded && len2(cmd) > 0.3 && (intent.boost || self.boosting || (arc_close && me.energy > 4.0));
+        // (Never for convenience while the mover is saving energy for a climb.)
+        let boost = me.grounded && len2(cmd) > 0.3 && (((intent.boost || self.boosting) && !d.waiting) || (arc_close && me.energy > 4.0));
         (cmd, boost, false)
     }
 
