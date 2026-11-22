@@ -2015,7 +2015,7 @@ impl Bot {
         let offer = obs.offer.as_ref()?;
         let mut best = (f32::NEG_INFINITY, 0u32);
         for (i, c) in offer.choices.iter().enumerate() {
-            let mut w = crate::config::upgrade_weight(&c.id);
+            let mut w = crate::config::upgrade_weight_for(&c.id, self.tune.ffa);
             if c.id.starts_with("laser_") && c.id != "laser_pierce" {
                 w += self.tune.up_laser;
             } else if c.id.starts_with("gun_") {

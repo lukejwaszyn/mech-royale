@@ -277,8 +277,35 @@ pub const UPGRADE_WEIGHTS: &[(&str, f32)] = &[
     ("laser_pierce", 2.0),
 ];
 
+/// Entries that replace the table above in the practice run. There one squad hunts us
+/// and kills are the points: damage upgrades act at once and shorten every later fight,
+/// while regeneration needs 5 s without dealing or taking damage. By the rule numbers
+/// (sustained fire): the drum magazine (20 rounds, 1.92 s reload) is +31% gun damage per
+/// second, tungsten rounds +15%, the rotary feed +8% (the reload dominates); the lens
+/// +18% laser damage, fast capacitors +8.5% (cycle 2.4 -> 2.21 s).
+pub const UPGRADE_WEIGHTS_PRACTICE: &[(&str, f32)] = &[
+    ("plating", 10.0),
+    ("gun_mag", 9.5),
+    ("laser_damage", 9.0),
+    ("gun_damage", 8.5),
+    ("armor", 8.0),
+    ("laser_charge", 7.5),
+    ("gun_rate", 6.5),
+    ("nanites", 6.0),
+];
+
 pub fn upgrade_weight(id: &str) -> f32 {
     UPGRADE_WEIGHTS.iter().find(|(k, _)| *k == id).map(|(_, w)| *w).unwrap_or(1.0)
+}
+
+/// The weight for the mode being played (`ffa` = the free-for-all table above).
+pub fn upgrade_weight_for(id: &str, ffa: bool) -> f32 {
+    if !ffa {
+        if let Some((_, w)) = UPGRADE_WEIGHTS_PRACTICE.iter().find(|(k, _)| *k == id) {
+            return *w;
+        }
+    }
+    upgrade_weight(id)
 }
 
 impl Tuning {
@@ -346,5 +373,18 @@ mod tests {
         assert!(t.ffa);
         assert_eq!(bad, vec!["nope=1".to_string(), "x".to_string()]);
         assert!(Tuning::names().contains(&"zone_margin_s"));
+    }
+
+    /// The practice table follows the arithmetic of sustained fire; the free-for-all
+    /// table is the general one.
+    #[test]
+    fn upgrade_tables_by_mode() {
+        let p = |id| upgrade_weight_for(id, false);
+        assert!(p("plating") > p("gun_mag") && p("gun_mag") > p("gun_damage") && p("gun_damage") > p("gun_rate"));
+        assert!(p("laser_damage") > p("laser_charge") && p("gun_mag") > p("nanites"));
+        assert_eq!(p("servos"), upgrade_weight("servos"));
+        for (id, w) in UPGRADE_WEIGHTS {
+            assert_eq!(upgrade_weight_for(id, true), *w);
+        }
     }
 }
