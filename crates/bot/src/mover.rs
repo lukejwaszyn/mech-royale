@@ -321,3 +321,41 @@ impl Mover {
         Some(Drive { dir: self.recover_dir, jump, jet: false, hard: true, ..Default::default() })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn access() -> Access {
+        Access { ground: [10.0, 0.0, 0.0], ground_node: 0, top: [16.0, 0.0, 20.0], top_node: 1, crest: 20.0, climb: 20.0, climb_out: 0.0 }
+    }
+    fn hop(a: &Access, from: V3) -> Hop {
+        Hop { to: a.top, crest: a.crest, t0: 0.0, need_jump: true, jumped_t: 0.0, left_ground: false, span: dist2d(from, a.top), from, ground: a.ground, up: true }
+    }
+
+    /// A hop that ends where it began (the jump never left the ground, or the jet was
+    /// stopped) is a failure; two of them and the access is not used again. One that
+    /// ends on the roof is not.
+    #[test]
+    fn failed_hops_ban_the_access() {
+        let a = access();
+        let mut m = Mover::new();
+        let start = [11.2, 0.5, 0.0];
+        let mut me = SelfObs { pos: start, ..Default::default() };
+        m.note_hop_end(&hop(&a, start), &me);
+        assert!(!m.access_bad(&a), "one failure is not proof");
+        m.note_hop_end(&hop(&a, start), &me);
+        assert!(m.access_bad(&a), "two failures ban it");
+        assert_eq!(m.hop_failures, 2);
+        // another access of the same roof is untouched
+        let b = Access { ground: [10.0, 30.0, 0.0], ..a };
+        assert!(!m.access_bad(&b));
+        // a hop that arrives is not counted
+        let mut m = Mover::new();
+        me.pos = [15.4, 0.2, 20.0];
+        m.note_hop_end(&hop(&a, start), &me);
+        m.note_hop_end(&hop(&a, start), &me);
+        assert!(!m.access_bad(&a));
+        assert_eq!(m.hop_failures, 0);
+    }
+}

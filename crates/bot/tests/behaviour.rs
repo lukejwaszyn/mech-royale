@@ -279,3 +279,69 @@ fn turns_to_an_attacker_it_cannot_see() {
     assert!(bot.model.track(9).unwrap().hit_us_t > 2.0, "the new track carries the hits it dealt unseen");
     assert_eq!(bot.target, Some(9), "the mech that is hitting us is the target");
 }
+
+/// Idling just inside the rim of the next circle: the same decision at 3 m and at 8 m
+/// inside it. (A ring 5-11 m inside the rim used to call for a walk to the holding
+/// spot while the last 5 m did not; where the way to the holding spot led outwards the
+/// bot paced across that line for the rest of the phase.)
+#[test]
+fn idling_at_the_rim_of_the_next_circle_is_steady() {
+    let mode_at = |inside: f32| {
+        let mut s = session(Tuning::default());
+        let pos = [ZONE_C[0] + 380.0 - inside, ZONE_C[1], 0.0];
+        for k in 0..3 {
+            step(&mut s, &obs(k, pos, [0.0, 0.0], json!([gun(), laser()]), json!({})));
+        }
+        format!("{:?}", s.bot.as_ref().unwrap().mode)
+    };
+    let (near, far) = (mode_at(3.0), mode_at(8.0));
+    assert_eq!(near, far, "3 m and 8 m inside the rim");
+    assert_ne!(far, "Zone", "inside the next circle with a minute to go is not a zone errand");
+}
+
+/// A session on a small flat map with one building (x 20..60, y -30..-1), for the
+/// tests that need a wall.
+fn session_with_building(tune: Tuning) -> Session {
+    use std::sync::Arc;
+    let text = include_str!("fixtures/stream.jsonl");
+    let hello_v: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let hello: bot::proto::Hello = serde_json::from_value(hello_v).unwrap();
+    let map = json!({
+        "bounds": {"minX": -300.0, "maxX": 300.0, "minY": -300.0, "maxY": 300.0},
+        "terrain": {"minX": -310.0, "minY": -310.0, "step": 620.0, "nx": 2, "ny": 2},
+        "prisms": [{"kind": "building", "base": -5.0, "top": 30.0, "ring": [20.0, -30.0, 60.0, -30.0, 60.0, -1.0, 20.0, -1.0]}]
+    });
+    let world = Arc::new(world::World::from_bytes(map.to_string().as_bytes(), &[0u8; 8]).unwrap());
+    let c = &hello.config.mech;
+    let nav = world::Nav::build(world.clone(), world::NavParams { radius: c.radius, height: c.height, step_up: c.step_up, max_slope_deg: c.max_slope_deg, ..world::NavParams::default() });
+    let mut s = Session::new(tune.clone());
+    s.bot = Some(bot::brain::Bot::with_parts(&hello, tune, world, vec![(0.0, nav)], true));
+    s
+}
+
+/// Jinking in a fight never steps to where the target is out of our line of fire: with
+/// a building to one side the bot strafes the other way. (It used to step behind the
+/// corner, walk out again for the line of fire, and so on - on one roof edge for more
+/// than a minute without landing a shot.)
+#[test]
+fn strafing_keeps_the_line_of_fire() {
+    let run = |tune: Tuning| -> f32 {
+        let mut s = session_with_building(tune);
+        // the target far to the east shoots at us; south of us the building's corner
+        // hides it, north is open
+        let here = [0.0, 0.0, 0.0];
+        let mut lowest = 0.0f32;
+        for k in 0..80 {
+            let foe = json!([mech(7, [160.0, 0.0, 0.0], [0.0, 0.0, 0.0], [3.14, 0.0], json!(["gun"]))]);
+            let ev = if k % 3 == 0 { json!([{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.0, "by": 7}]) } else { json!([]) };
+            let o = obs(k, here, [0.0, 0.0], json!([gun(), laser()]), json!({"mechs": foe, "events": ev, "zone": {"center": [0.0, 0.0], "radius": 560.0, "next_center": [0.0, 0.0], "next_radius": 380.0, "shrink_start": 60.0, "shrink_end": 110.0, "dps": 20.0}}));
+            let a = step(&mut s, &o);
+            lowest = lowest.min(a["move"][1].as_f64().unwrap() as f32);
+        }
+        lowest
+    };
+    let mut off = Tuning::default();
+    off.los_keep = 0.0;
+    assert!(run(off) < -0.5, "without the rule the jink goes behind the corner too (the test bites)");
+    assert!(run(Tuning::default()) > -0.3, "with it, no step south into the building's shadow");
+}

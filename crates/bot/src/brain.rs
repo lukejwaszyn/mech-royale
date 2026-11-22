@@ -264,6 +264,13 @@ pub struct Diag {
     pub boost_s: f32,
     /// Roof hops that did not arrive.
     pub hop_fail: f32,
+    /// Cubes we knew of on the ground at the end, seconds with a known cube lying
+    /// around (while below the cap), and those seconds by mode: fight, loot, hold.
+    pub cubes_left: f32,
+    pub cube_known_s: f32,
+    pub cube_known_mode: [f32; 3],
+    /// Mean distance to the nearest known cube during those seconds (sum; divide by cube_known_s).
+    pub cube_dist_sum: f32,
     /// First contacts (a mech hits us or becomes our fight target for the first time)
     /// by distance: < 60 m, < 110, < 160, further.
     pub contact: [f32; 4],
@@ -321,6 +328,12 @@ impl Diag {
             ("close_loothold", self.close_s[7]),
             ("boost_s", self.boost_s),
             ("hop_fail", self.hop_fail),
+            ("cubes_left", self.cubes_left),
+            ("cube_known_s", self.cube_known_s),
+            ("cube_known_fight", self.cube_known_mode[0]),
+            ("cube_known_loot", self.cube_known_mode[1]),
+            ("cube_known_hold", self.cube_known_mode[2]),
+            ("cube_dist_sum", self.cube_dist_sum),
             ("contact_d60", self.contact[0]),
             ("contact_d110", self.contact[1]),
             ("contact_d160", self.contact[2]),
@@ -617,6 +630,10 @@ impl Bot {
         }
         if obs.t - self.last_mode_log >= 10.0 {
             self.last_mode_log = obs.t;
+            if self.verbose {
+                let cs: Vec<String> = self.model.cubes.iter().map(|c| format!("{}:d{:.0}/dz{:.0}/age{:.0}{}", c.id, dist2d(c.pos, f.pos), c.pos[2] - f.pos[2], obs.t - c.seen_t, if f.zone.inside_next([c.pos[0], c.pos[1]], 0.0) { "" } else { "/out" })).collect();
+                eprintln!("[cubes] t={:.0} have={} known: {}", obs.t, obs.me.cubes, cs.join(" "));
+            }
             eprintln!(
                 "[bot] t={:.0} {:?} hp={:.0}/{:.0} cubes={} alive={} foes={} engaged={} kills={} avg={:.2}ms max={:.1}ms stuck={}",
                 obs.t, self.mode, obs.me.hp, obs.me.max_hp, obs.me.cubes, obs.alive, sit.foes.len(), sit.n_engaged, self.model.kills,
@@ -636,8 +653,21 @@ impl Bot {
         let prev_mode = self.prev_mode;
         self.prev_mode = intent.mode;
         let hop_fail = self.mover.hop_failures as f32;
+        let cubes_known = self.model.cubes.len() as f32;
+        let cube_near = self.model.cubes.iter().map(|c| dist2d(c.pos, f.pos)).fold(f32::INFINITY, f32::min);
+        let max_cubes = self.tune.max_cubes;
         let d = &mut self.diag;
         d.cubes = obs.me.cubes;
+        d.cubes_left = cubes_known;
+        if cubes_known > 0.0 && obs.me.cubes < max_cubes {
+            d.cube_known_s += dt;
+            d.cube_dist_sum += cube_near * dt;
+            match intent.mode {
+                Mode::Fight => d.cube_known_mode[0] += dt,
+                Mode::Loot => d.cube_known_mode[1] += dt,
+                _ => d.cube_known_mode[2] += dt,
+            }
+        }
         d.hop_fail = hop_fail;
         d.mode_s[match intent.mode {
             Mode::Final => 0,
@@ -812,9 +842,11 @@ impl Bot {
         if !me.in_zone {
             return 2;
         }
-        let inner = self.tune.zone_inner_margin.min(z.nr * 0.35);
+        // Inside the next circle: nothing to do. (This used to ask for a drift further
+        // in from a ring 5-11 m inside the rim, but not from the last 5 m - where the
+        // clock below decides - so a bot idling at the rim walked in and out for ever.)
         let leaves = match z.leaves_at(f.xy, 5.0) {
-            None => return if z.inside_next(f.xy, inner * 0.5) { 0 } else { 1 },
+            None => return 0,
             Some(t) => t,
         };
         let walk = self.safe_dist(f);
@@ -1115,7 +1147,8 @@ impl Bot {
         // edge otherwise drags us out again and again (kiting, strafing), and the zone
         // does the enemy's work.
         let need = self.zone_need(f, obs);
-        self.zone_run = need == 2 || (self.zone_run && need == 1);
+        let deep = z.inside_next(f.xy, self.tune.zone_inner_margin.min(z.nr * 0.35) * 0.5);
+        self.zone_run = need == 2 || (self.zone_run && !deep);
         if self.zone_run {
             let nav = &self.navs[f.nav_idx].1;
             let step = self.safe_field.as_ref().and_then(|fl| nav.field_next(fl, f.pos, 40.0));
@@ -1410,9 +1443,9 @@ impl Bot {
             let near = dist2d(p, f.pos) < 15.0;
             sit.foes.iter().filter(|x| x.age < 6.0).all(|x| {
                 let lightning = x.weapons & W_LIGHTNING != 0;
-                let mut keep = if lightning { arc + 20.0 } else { 55.0 };
+                let mut keep = if lightning { arc + 20.0 } else { self.tune.errand_keep };
                 if x.id == tg.id && !near {
-                    keep = keep.max(0.6 * tg.dist.min(rmin));
+                    keep = keep.max(self.tune.errand_keep_frac * tg.dist.min(rmin));
                 }
                 if prize {
                     // The laser doubles our damage: fetch it unless the way there passes
@@ -1626,6 +1659,57 @@ impl Bot {
             // keep pressing inside arc range
             it.away = Some((bearing, 0.3));
         }
+        // The others: every mech that is not the target and stands closer than we like
+        // pushes us away too (in the practice run each of them is, or will be, a hunter).
+        // The legs then open the distance to all of them, not only to the one we shoot.
+        let rep = self.tune.crowd_repel;
+        if rep > 0.0 && !has_lightning {
+            let reach = rmin.min(140.0);
+            let mut v = match it.away {
+                Some((d, w)) => [d[0] * w, d[1] * w],
+                None => [0.0, 0.0],
+            };
+            let mut any = false;
+            for x in sit.foes.iter().filter(|x| x.id != tg.id && x.age < 5.0 && x.dist < reach) {
+                let w = rep * (1.0 - x.dist / reach);
+                let d = norm2([f.xy[0] - x.pos[0], f.xy[1] - x.pos[1]]);
+                v = [v[0] + d[0] * w, v[1] + d[1] * w];
+                any = true;
+            }
+            if any && len2(v) > 0.05 {
+                it.away = Some((norm2(v), len2(v).min(2.6)));
+            }
+        }
+        // Cubes lie where mechs died, and most are never collected because the fight
+        // has moved on. Let the fight drift towards the nearest one that no other mech
+        // stands next to: the legs have to go somewhere anyway.
+        let pull = self.tune.cube_pull;
+        if pull > 0.0 && me.cubes < self.tune.max_cubes {
+            let mut best: Option<(f32, V3)> = None;
+            for c in &self.model.cubes {
+                let d = dist2d(c.pos, f.pos);
+                if d > self.tune.cube_pull_range || (c.pos[2] - f.pos[2]).abs() > 4.0 || !f.zone.inside_at([c.pos[0], c.pos[1]], t + 6.0, 5.0) {
+                    continue;
+                }
+                // not into the arms of the enemy: the cube must be nearer to us than to it
+                let crowded = sit.foes.iter().filter(|x| x.age < 6.0).any(|x| dist2d(x.pos, c.pos) < self.tune.cube_pull_clear.max(if x.id == tg.id { 0.0 } else { 45.0 }) || dist2d(x.pos, c.pos) < d);
+                if !crowded && best.map_or(true, |b| d < b.0) {
+                    best = Some((d, c.pos));
+                }
+            }
+            if let Some((d, p)) = best {
+                let dir = norm2([p[0] - f.xy[0], p[1] - f.xy[1]]);
+                let mut v = match it.away {
+                    Some((a, w)) => [a[0] * w, a[1] * w],
+                    None => [0.0, 0.0],
+                };
+                let w = pull * if d < 25.0 { 1.6 } else { 1.0 };
+                v = [v[0] + dir[0] * w, v[1] + dir[1] * w];
+                if len2(v) > 0.05 {
+                    it.away = Some((norm2(v), len2(v).min(2.6)));
+                }
+            }
+        }
         it
     }
 
@@ -1688,18 +1772,8 @@ impl Bot {
                 others.push((norm2([foe.pos[0] - f.xy[0], foe.pos[1] - f.xy[1]]), self.tune.crowd_avoid * (1.0 - foe.dist / 150.0)));
             }
         }
+        let under_fire = sit.n_engaged > 0 || self.model.dmg_recent > 40.0;
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
-        // Fighting near the rim of the circle the zone is closing to (or outside it)
-        // ends with our back to the wall of the zone: while strafing and kiting, lean
-        // towards its inside, harder the further out we are.
-        let zone_pull: Option<(V2, f32)> = if self.tune.zone_pull > 0.0 && f.zone.nr > 30.0 && !matches!(intent.mode, Mode::Final | Mode::Zone) {
-            let to_c = [f.zone.nc[0] - f.xy[0], f.zone.nc[1] - f.xy[1]];
-            let dc = len2(to_c);
-            let k = ((dc - 0.55 * f.zone.nr) / (0.45 * f.zone.nr)).clamp(0.0, 1.6);
-            if k > 0.0 { Some((norm2(to_c), self.tune.zone_pull * k)) } else { None }
-        } else {
-            None
-        };
         let mut cmd = d.dir;
         if !plain && me.grounded {
             let speed = if intent.boost || arc_close { me.stats.boost_speed } else { me.stats.walk_speed };
@@ -1722,12 +1796,17 @@ impl Bot {
                 if let Some((dir, w)) = intent.away {
                     s += w * dot2(c, dir);
                 }
-                if let Some((dir, w)) = zone_pull {
-                    s += w * dot2(c, dir);
-                }
                 if k == n {
                     // standing still is only right when we have arrived and nothing is incoming
-                    s -= if intent.strafe.is_some() || intent.away.is_some() { 0.6 } else { 0.0 };
+                    // (and never while we are being shot: a standing mech is hit by everything,
+                    // so rather step out of our own line of fire than hold it standing)
+                    s -= if under_fire && intent.strafe.is_some() {
+                        self.tune.stand_penalty
+                    } else if intent.strafe.is_some() || intent.away.is_some() {
+                        0.6
+                    } else {
+                        0.0
+                    };
                 } else {
                     // walls and ledges
                     // (a blocked step costs more than any pull: rubbing along a wall

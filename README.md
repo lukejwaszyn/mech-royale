@@ -150,6 +150,26 @@ visible bullets take 0.6 s to arrive. An enemy that closes in is kited: the legs
 while the torso keeps firing. Kiting never walks into a wall [`wall_penalty`], out of the
 zone, or towards other mechs [`crowd_avoid`, +0.2].
 
+**Run from a close enemy** [+0.3]. Under 60 m everything hits, whoever aims: two fifths
+of all damage taken in the simulator came from there. Both sides walk at the same speed,
+so only the boost opens the distance: inside `kite_boost_dist` (90 m) the bot kites on
+boost while there is energy (`kite_boost_start`). An errand under the guns of a target
+that close (the laser, a cube) is run, not walked (`errand_boost`).
+
+**Face what is shooting** (robustness; small in the simulator, fatal when it happens). A
+`damaged` event names its author and gives the bearing of the shot even when the server
+does not list that mech to us. The bot used to keep its guns on its target and its back
+to such an attacker until it died, every hit a rear hit (x1.5). Now the torso turns to
+the bearing once the unseen mech's recent damage reaches `blind_turn_dmg` (unless the
+target in front dies to what is already loaded), and a mech that comes into view already
+shooting is an attacker from its first frame.
+
+**Keep the line of fire** (robustness). While jinking or kiting, a step to where the
+target is hidden costs `los_keep`. Without it the bot stepped behind a corner or back
+from a roof edge, walked out again for the shot, and repeated that for a minute at a
+time, the laser held at half speed and firing itself into the wall. Under fire, standing
+still costs more than that (`stand_penalty`): rather out of the line than standing in it.
+
 **Stay out of lightning arcs** [+0.25]. Lightning never misses inside 45 m and does 240
 damage per second. Every known carrier is a repulsor in the steering, in every mode, and
 inside arc range + 8 m the bot boosts away.
@@ -182,8 +202,17 @@ past buildings and tree trunks) is forgotten after 0.6 s and not believed again 
 **Zone.** A walking-distance field to the inside of the next circle is rebuilt each phase.
 We leave when the closing edge would reach our position within a margin plus the detour
 the buildings force, and once on the way in we keep going until properly inside, fight or
-no fight. In the last phase the circle closes to nothing: the bot goes to the centre and
-stays there.
+no fight. Inside the next circle there is nothing to do, at any depth (a ring a few
+metres inside the rim used to ask for a walk further in while the rim itself did not, and
+a bot idling there paced across that line). In the last phase the circle closes to
+nothing: the bot goes to the centre and stays there. In the simulator the rim is the
+safer place to fight (the squad gathers inside): a pull towards the centre while kiting
+cost up to 0.8 points and was removed.
+
+**Roofs.** A hop that does not arrive (the jump never leaves the ground, the jet is
+stopped) is counted against its access point; after two failures that access is not used
+again in the match, and loot on a roof with no access left is ignored. Before, the bot
+jumped at one wall for a minute and a half, one loot item after the other.
 
 **Free-for-all (`MECH_MODE=ffa`).** For the final against other teams' bots: never starts
 a fight with a healthy mech, only finishes weak ones; retreats to cover when hurt or
@@ -200,7 +229,10 @@ Verified here:
 * behaviour tests (`crates/bot/tests/behaviour.rs`): one small synthetic situation per bug
   the simulator exposed — loot memory and ghosts, destroyed drones, shooting back at
   drones, the loot rule at the next circle's edge, the laser while kiting, lightning arcs,
-  first strike only in practice mode, kill shots, no running from a single attacker;
+  first strike only in practice mode, kill shots, no running from a single attacker,
+  turning to an attacker out of view, idling at the rim of the next circle, strafing
+  that keeps the line of fire (on a small map with one building), and giving up a roof
+  access after failed hops (unit test in `mover.rs`);
 * `check.py` on the native binary and on the amd64 image in the match sandbox.
 
 Closed-loop numbers, all from `crates/sim` (see its README; they do not predict the

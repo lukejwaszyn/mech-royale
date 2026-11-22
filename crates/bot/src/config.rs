@@ -100,6 +100,9 @@ tuning! {
     arc_avoid = 3.0,
     /// Weight of not walking towards mechs other than our target while fighting (0 = off).
     crowd_avoid = 2.0,
+    /// While strafing or kiting: back away from every other mech closer than our minimum
+    /// range too, with this weight at point-blank (0 = only from the target).
+    crowd_repel = 0.0,
     /// Steering: cost of a step that runs into a wall or off a ledge.
     wall_penalty = 5.0,
     strafe_period_min = 0.45,
@@ -120,12 +123,12 @@ tuning! {
     /// Boost on an errand (laser, cube) during a fight while the target is in sight
     /// and closer than this (0 = walk).
     errand_boost = 90.0,
-    /// While strafing or kiting: lean towards the inside of the next circle, with this
-    /// weight at its rim (0 inside 55% of its radius, more outside; 0 = off).
-    zone_pull = 0.0,
     /// While strafing or kiting in a fight: cost of a step that loses the line of fire
     /// to the target (0 = off).
     los_keep = 3.0,
+    /// Cost of standing still while strafing under fire (above `los_keep`: when every
+    /// step would lose the line of fire, step out of it rather than stand in it).
+    stand_penalty = 3.5,
     /// Weight of dodging visible projectiles against following the path.
     dodge_weight = 4.0,
     strafe_weight = 1.0,
@@ -198,8 +201,21 @@ tuning! {
     /// During a fight, walk to a wanted laser within this distance if that does not
     /// take us towards the enemy (0 = off); cubes and other wanted weapons within a quarter of it.
     errand_range = 180.0,
+    /// ... if it lies at least this far from every enemy, and from the target at least
+    /// this fraction of our distance to it.
+    errand_keep = 55.0,
+    errand_keep_frac = 0.6,
     /// ... cubes within this fraction of `errand_range`.
     errand_cube_frac = 0.25,
+    /// A cube is fetched (outside fights) unless a mech we are not fighting stands
+    /// within this distance of it.
+    cube_keep = 90.0,
+    /// While strafing or kiting: weight of drifting towards the nearest cube within
+    /// `cube_pull_range` that is nearer to us than to any enemy and at least
+    /// `cube_pull_clear` from the target (0 = off).
+    cube_pull = 0.0,
+    cube_pull_range = 120.0,
+    cube_pull_clear = 50.0,
     /// Shooting crates and drones resets regeneration: only above this HP fraction.
     farm_min_hp = 0.8,
     /// Cubes stop adding HP and damage at the stat cap but keep growing the mech: stop collecting here.
