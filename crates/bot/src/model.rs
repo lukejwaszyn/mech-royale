@@ -220,12 +220,12 @@ impl Model {
                 }
                 "took" => {
                     self.last_took_t = t;
-                    if let Some(id) = e.id.as_ref().and_then(|v| v.as_i64()) {
+                    if let Some(id) = e.id.as_ref().and_then(|v| v.as_f64()).map(|x| x as i64) {
                         self.pickups.retain(|p| p.id != id);
                     }
                 }
                 "take_failed" => {
-                    if let Some(id) = e.id.as_ref().and_then(|v| v.as_i64()) {
+                    if let Some(id) = e.id.as_ref().and_then(|v| v.as_f64()).map(|x| x as i64) {
                         match e.reason.as_deref() {
                             Some("gone") => self.pickups.retain(|p| p.id != id),
                             Some("have") | Some("full") | Some("busy") => {
