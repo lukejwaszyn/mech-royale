@@ -134,6 +134,9 @@ tuning! {
     strafe_weight = 1.0,
     /// Start moving this many seconds before the closing circle would reach us.
     zone_margin_s = 9.0,
+    /// With the closing circle this close (s) or past us, walking in overrides keeping
+    /// clear of lightning arcs.
+    zone_force_s = 6.0,
     /// Aim to stand this far inside the next circle (capped at 35% of its radius).
     zone_inner_margin = 22.0,
     /// Energy kept back for emergencies when boosting for convenience.

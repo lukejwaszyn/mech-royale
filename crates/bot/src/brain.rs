@@ -1764,6 +1764,16 @@ impl Bot {
                 arcs.push(([foe.pos[0] + tr.vel_s[0] * 0.5, foe.pos[1] + tr.vel_s[1] * 0.5], foe.dist));
             }
         }
+        // The zone is certain, an arc is not: when the circle is about to pass us (or
+        // has), or in the last circle where every arc reaches everywhere, nothing keeps
+        // us from walking in. (Sixteen mechs converging on a small circle with a few
+        // lightning carriers inside it had the bot stand still at the rim, every step
+        // inwards costing more than standing, until the zone killed it.)
+        let zone_urgent = matches!(intent.mode, Mode::Final)
+            || (matches!(intent.mode, Mode::Zone) && (!me.in_zone || f.zone.leaves_at(f.xy, 5.0).map_or(false, |tl| tl - t < self.tune.zone_force_s)));
+        if zone_urgent {
+            arcs.clear();
+        }
         let arc_close = arcs.iter().any(|a| a.1 < arc_r + 8.0);
         // Mechs other than the one we fight: do not walk (kite, strafe, dodge) into them.
         let mut others: Vec<(V2, f32)> = Vec::new();
@@ -1800,7 +1810,9 @@ impl Bot {
                     // standing still is only right when we have arrived and nothing is incoming
                     // (and never while we are being shot: a standing mech is hit by everything,
                     // so rather step out of our own line of fire than hold it standing)
-                    s -= if under_fire && intent.strafe.is_some() {
+                    s -= if zone_urgent && !d.arrived {
+                        6.0
+                    } else if under_fire && intent.strafe.is_some() {
                         self.tune.stand_penalty
                     } else if intent.strafe.is_some() || intent.away.is_some() {
                         0.6

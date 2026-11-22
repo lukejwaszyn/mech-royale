@@ -345,3 +345,28 @@ fn strafing_keeps_the_line_of_fire() {
     assert!(run(off) < -0.5, "without the rule the jink goes behind the corner too (the test bites)");
     assert!(run(Tuning::default()) > -0.3, "with it, no step south into the building's shadow");
 }
+
+/// With the circle about to pass us, a lightning carrier standing inside it does not
+/// keep the bot from walking in. (Every step inwards used to cost more than standing
+/// still, and the bot stood at the rim until the zone killed it.)
+#[test]
+fn walks_into_the_zone_past_a_lightning_carrier() {
+    let east = |tune: Tuning| -> f64 {
+        let mut s = session(tune);
+        // a small circle to the east; we stand 20 m outside its rim, the current circle is
+        // closing on it and reaches us in a few seconds; a lightning carrier stands between
+        let zone = json!({"center": [100.0, 0.0], "radius": 135.0, "next_center": [100.0, 0.0], "next_radius": 70.0, "shrink_start": 0.0, "shrink_end": 30.0, "dps": 100.0});
+        let pos = [-20.0, 0.0, 0.0];
+        let foe = json!([mech(7, [25.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.5, 0.0], json!(["gun", "lightning"]))]);
+        let mut a = json!(null);
+        for k in 0..4 {
+            a = step(&mut s, &obs(k, pos, [0.0, 0.0], json!([gun(), laser()]), json!({"mechs": foe, "zone": zone})));
+        }
+        assert_eq!(format!("{:?}", s.bot.as_ref().unwrap().mode), "Zone");
+        a["move"][0].as_f64().unwrap()
+    };
+    let mut never = Tuning::default();
+    never.zone_force_s = -1.0;
+    assert!(east(never) < 0.5, "without the rule the arc holds the bot back (the test bites)");
+    assert!(east(Tuning::default()) > 0.5, "walking east into the circle");
+}

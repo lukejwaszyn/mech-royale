@@ -242,11 +242,32 @@ run):
 | | mean of 16 − place |
 |---|---|
 | bot as first written, against the simulated squad | 2.4 |
-| this version, against the simulated squad (1500 matches) | 4.4 |
-| this version, starting with a laser (the ceiling of "get a laser sooner") | 5.4 |
-| this version, 15 scripted bots each for itself | 13.1 |
+| after the first integration round, against the simulated squad (seeds 1000-1599) | 4.4 |
+| this version, same seeds (600 matches) | 4.85 |
+| this version on fresh seeds 7000-7999 (1000 matches); the round-two rules switched off: 4.25 | 4.66 |
+| this version, 15 scripted bots each for itself (300 matches; ffa preset: 13.4) | 13.7 |
+
+One standard error is about 0.11 at 600 matches and 0.085 at 1000, so differences below
+0.2 between two runs mean nothing. (The simulator's own rules changed in round two - jumps
+on rising ground, the slide out from under an eave - which is why the last rows compare
+on the same simulator.) The real binary over pipes, 32 matches against the squad: no
+late answer, slowest answer 13 ms; four 16-way matches of the real binary in ffa mode:
+no late answer, none over 20 ms, no crash.
 
 Open problems, largest first:
+
+* **A third of first contacts happen inside 60 m**, and two fifths of all damage is
+  taken there: a second mech arrives unnoticed while the guns are on the first (1.1 per
+  match), or comes round a corner while the bot loots (0.6) or hides (0.6). Backing
+  away from every near mech (`crowd_repel`), backing away from a hidden target
+  (`blind_kite_dist`) and zig-zag kiting all measured as noise or worse; the knobs are
+  there, off.
+* **Half the cubes stay on the ground.** At death the bot knows of 8 cubes lying about
+  and holds 5; they lie where mechs died, 30-120 m away on the enemy's side. Fetching
+  them under fire (`errand_keep`, `errand_cube_frac`, `cube_keep`, `cube_pull`) cost as
+  much as it gained in the simulator. Ten cubes would be +40% HP and damage and four
+  upgrades, so this is the largest untapped reserve if the real squad shoots worse at
+  close range than the scripted one.
 
 * **No laser in 28% of matches** (15% never see one, 13% see one and do not reach it);
   those matches average 2.0 points. Looking for one deliberately, and killing laser
@@ -257,7 +278,14 @@ Open problems, largest first:
 * **Lightning in our own hands** is worth nothing as played (rushing costs as much as it
   gains), so it is valued low. A corner ambush would be the way to use it.
 * The free-for-all preset cannot be judged here: the scripted free-for-all is far too
-  bloody, and sixteen copies of this bot mostly stand apart until the last circle.
+  bloody, and sixteen copies of this bot stand apart, several without a single cube,
+  until the last circle, where the order of death is the order of HP. In four 16-way
+  matches of the real binary two mechs still died to the zone outside the 25 m circle
+  (crowded out or caught in a fight at its rim; not investigated).
+* **Timing spike.** The walking-distance field of a new zone phase costs about 12 ms
+  once per phase (seven times per match). On a slow or loaded host that one decision can
+  pass the bot's own 30 ms deadline and go out as a coasting answer - never late, but a
+  wasted tick. Building the field on a helper thread would remove it.
 * The final centre is taken as the nearest walkable ground; a roof over the centre is not
   used.
 
