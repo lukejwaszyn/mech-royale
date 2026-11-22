@@ -443,3 +443,76 @@ fn gives_up_a_cube_it_cannot_collect() {
     let a = step(&mut s, &obs(60, HERE, [0.0, 0.0], json!([gun(), null]), json!({"cubes": cube})));
     assert!(s.bot.as_ref().unwrap().model.cubes.is_empty(), "and stays forgotten: {a}");
 }
+
+/// Last circle: the spot is chosen by when the closing circle passes it, not by its
+/// distance from the final point. With the final point itself taken by another mech,
+/// the bot goes for the free spot on the side the circle closes from (which stays
+/// inside longest), not for the nearest one on the far side - and it runs there.
+#[test]
+fn last_circle_takes_the_spot_the_zone_passes_last() {
+    let c5 = [HERE[0], HERE[1]];
+    let cf = [HERE[0] + 15.0, HERE[1]];
+    let zone = json!({"center": c5, "radius": 25.0, "next_center": cf, "next_radius": 0.0, "shrink_start": 390.0, "shrink_end": 415.0, "dps": 260.0});
+    let squatter = mech(7, [cf[0], cf[1], 0.0], [0.0, 0.0, 0.0], [0.0, 0.0], json!(["gun"]));
+    let run = |from: [f32; 3], tune: Tuning| -> Value {
+        let mut s = session(tune);
+        let mut a = Value::Null;
+        for k in 3760..3766 {
+            a = step(&mut s, &obs(k, from, [0.0, 0.0], json!([gun(), null]), json!({"zone": zone, "mechs": [squatter], "alive": 6})));
+        }
+        assert_eq!(s.bot.as_ref().unwrap().mode, bot::brain::Mode::Final);
+        a
+    };
+    // From the far side (east of the final point): the old rule stops at the nearest
+    // free ground, on the far side; the new one walks round to the near side.
+    let east = [cf[0] + 9.0, cf[1] + 3.0, 0.0];
+    let a = run(east, Tuning::default());
+    assert!(a["move"][0].as_f64().unwrap() < -0.3, "heads past the final point to the side the circle comes from: {a}");
+    assert_eq!(a["boost"], json!(true), "and runs: {a}");
+    // From the near side it stops short of the squatter, between the two centres.
+    let west = [cf[0] - 5.5, cf[1], 0.0];
+    let a = run(west, Tuning::default());
+    let (mx, my) = (a["move"][0].as_f64().unwrap(), a["move"][1].as_f64().unwrap());
+    assert!(mx.hypot(my) < 0.9 || mx < 0.5, "already on a good spot, no walking into the squatter: {a}");
+    // Outside the circle: straight towards its current centre, on boost.
+    let out = [c5[0] - 30.0, c5[1], 0.0];
+    let mut s = session(Tuning::default());
+    let mut a = Value::Null;
+    for k in 3760..3764 {
+        let mut o: Value = serde_json::from_str(&obs(k, out, [0.0, 0.0], json!([gun(), null]), json!({"zone": zone, "alive": 6}))).unwrap();
+        o["self"]["in_zone"] = json!(false);
+        a = step(&mut s, &o.to_string());
+    }
+    assert!(a["move"][0].as_f64().unwrap() > 0.9 && a["boost"] == json!(true), "outside: straight in, running: {a}");
+}
+
+/// Far first strike: a mech 175 m away that keeps coming straight at us is fired on
+/// after a moment (first contact is the longest range the fight will have); one that
+/// walks past at that distance is left alone, and so is everybody in free-for-all.
+#[test]
+fn far_first_strike_needs_a_mech_that_keeps_coming() {
+    let foe = [HERE[0] + 175.0, HERE[1], 0.0];
+    let run = |tune: Tuning, vel: [f32; 3], aim: f32| -> Option<u32> {
+        let mut s = session(tune);
+        for k in 0..40 {
+            let a = step(&mut s, &obs(k, HERE, [0.0, -0.02], json!([gun(), laser()]), json!({"mechs": [mech(7, foe, vel, [aim, 0.0], json!(["gun"]))]})));
+            if a["fire"][0] == json!(true) || a["fire"][1] == json!(true) {
+                return Some(k);
+            }
+        }
+        None
+    };
+    // coming, its guns elsewhere: only after it has kept coming for a while
+    let first = run(Tuning::default(), [-11.0, 0.0, 0.0], 1.2).expect("opens fire on the mech that keeps coming");
+    assert!((13..=30).contains(&first), "after about 1.5 s of coming straight at us (decision {first})");
+    // coming with its guns on us: at once
+    assert!(run(Tuning::default(), [-11.0, 0.0, 0.0], 3.14).expect("opens fire") <= 6);
+    assert_eq!(run(Tuning::default(), [0.0, 11.0, 0.0], 1.57), None, "a mech walking past is left alone");
+    assert_eq!(run(Tuning::default(), [0.0, 0.0, 0.0], 3.14), None, "and so is one that merely looks our way");
+    let mut off = Tuning::default();
+    off.first_strike_far = 0.0;
+    assert_eq!(run(off, [-11.0, 0.0, 0.0], 3.14), None, "switched off: nothing beyond the old range");
+    let mut ffa = Tuning::default();
+    ffa.apply_ffa();
+    assert_eq!(run(ffa, [-11.0, 0.0, 0.0], 3.14), None, "free-for-all: never");
+}

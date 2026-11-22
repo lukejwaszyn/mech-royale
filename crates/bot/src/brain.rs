@@ -11,7 +11,7 @@ use crate::mover::{Drive, Mover};
 use crate::proto::*;
 use std::sync::Arc;
 use std::time::Instant;
-use world::{Body, DistField, JetParams, Nav, NavParams, World};
+use world::{max_climb, Body, DistField, JetParams, Nav, NavParams, World};
 
 /// Cube counts the nav grids are built for (a mech grows 5% per cube).
 const NAV_TIERS: [f32; 5] = [0.0, 2.0, 5.0, 9.0, 14.0];
@@ -390,6 +390,8 @@ pub struct Bot {
     hide_inside: bool,
     /// Spot that hides us from the other attackers while we fight one: (place, chosen at).
     split: Option<(V3, f32)>,
+    /// Standing spot in the last circle: (place, it is on a roof, chosen at).
+    seat: Option<(V3, bool, f32)>,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -522,6 +524,7 @@ impl Bot {
             zone_run: false,
             hide_inside: false,
             split: None,
+            seat: None,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
@@ -1216,12 +1219,25 @@ impl Bot {
         let under_fire = sit.n_engaged > 0 || self.model.dmg_recent > 40.0;
 
         // 1. Endgame: the circle closes to nothing and every metre from its centre costs
-        //    seconds of zone damage. Get to the centre and stay there.
+        //    seconds of zone damage. Get to the best free spot and stay there.
         if z.nr <= 1.0 || z.r <= 30.0 {
-            let centre = self.navs[f.nav_idx].1.nearest_walkable(z.nc[0], z.nc[1]).unwrap_or(home);
-            let d = self.drive_to(f, obs, centre, 0.6, false);
+            if self.tune.final_seat <= 0.0 {
+                let centre = self.navs[f.nav_idx].1.nearest_walkable(z.nc[0], z.nc[1]).unwrap_or(home);
+                let d = self.drive_to(f, obs, centre, 0.6, false);
+                let mut it = Intent::new(Mode::Final, d, 3.0);
+                it.boost = d.remaining > 12.0 && (!me.in_zone || z.leaves_at(f.xy, 3.0).map_or(false, |t| t - f.t < 4.0));
+                it.no_charge = d.remaining > 6.0;
+                return it;
+            }
+            let (seat, roof) = self.final_seat(f, obs, sit).unwrap_or((home, false));
+            // Outside the circle nothing else counts: straight in, towards its centre.
+            let (goal, climb) = if me.in_zone { (seat, roof) } else { (self.navs[f.nav_idx].1.nearest_walkable(z.c[0], z.c[1]).unwrap_or(seat), false) };
+            let d = self.drive_to(f, obs, goal, 0.6, climb);
             let mut it = Intent::new(Mode::Final, d, 3.0);
-            it.boost = d.remaining > 12.0 && (!me.in_zone || z.leaves_at(f.xy, 3.0).map_or(false, |t| t - f.t < 4.0));
+            // The good spots go to whoever is there first (bodies are pushed apart): run.
+            // Energy has no better use now - except the hop onto a roof, and lightning.
+            let keep = if f.has(W_LIGHTNING) { 40.0 } else { 3.0 };
+            it.boost = !d.waiting && if !me.in_zone { d.remaining > 2.0 } else { d.remaining > 3.0 && !climb && me.energy > keep };
             it.no_charge = d.remaining > 6.0;
             return it;
         }
@@ -1351,6 +1367,98 @@ impl Bot {
             it.strafe = strafe_axis.map(|a| (a, 0.8));
         }
         it
+    }
+
+    /// The standing spot for the last circle: (place, whether it is on a roof).
+    ///
+    /// What decides the order of death there is how long each mech stands outside the
+    /// circle at its 260 HP/s, and that is very one-sided: the circle closes on the final
+    /// point from where its centre is now, so a spot on that side stays inside seconds
+    /// longer per metre than one on the far side. Bodies are pushed apart, so the point
+    /// itself goes to one mech. Hence: among the places to stand near the final point
+    /// that no mech nearer to them occupies, take the one the circle passes last (and
+    /// that we can reach before it does). When the final point lies inside a building,
+    /// its roof is such a place if we have the jet energy for the hop.
+    fn final_seat(&mut self, f: &Frame, obs: &Obs, sit: &Sit) -> Option<(V3, bool)> {
+        let t = f.t;
+        if let Some((p, roof, at)) = self.seat {
+            if t >= at && t - at < 0.5 {
+                return Some((p, roof));
+            }
+        }
+        let z = f.zone;
+        let me = &obs.me;
+        let nav = &self.navs[f.nav_idx].1;
+        let speed = me.stats.walk_speed.max(1.0);
+        let end = z.t1.max(t);
+        let cur = nav.nearest_node(f.pos);
+        let here = cur.map(|n| nav.comp_of(n));
+        let reach = 0.8 * max_climb(me.max_energy, &f.jet);
+        let spacing = f.body.radius + self.cfg.mech.radius + 0.5;
+        let mut best: Option<(f32, V3, bool)> = None;
+        for r in [self.tune.final_seat_r.max(4.0), 45.0] {
+            let (ci, cj) = nav.cell_of(z.nc[0], z.nc[1]);
+            let k = (r / nav.cell.max(0.5)).ceil() as i32;
+            for i in ci - k..=ci + k {
+                for j in cj - k..=cj + k {
+                    for n in nav.cell_nodes(i, j) {
+                        let p = nav.node_pos(n);
+                        let dc = (p[0] - z.nc[0]).hypot(p[1] - z.nc[1]);
+                        if dc > r {
+                            continue;
+                        }
+                        let mut travel = dist2d(p, f.pos) / speed;
+                        let mut roof = false;
+                        if Some(nav.comp_of(n)) != here {
+                            if !nav.is_main(n) {
+                                // another roof or yard: only by a hop we have the energy for now
+                                let Some(reg) = nav.region_of(n) else { continue };
+                                let a = reg
+                                    .access
+                                    .iter()
+                                    .filter(|a| a.climb < reach && a.climb <= self.tune.final_roof && !self.mover.access_bad(a) && me.energy >= crate::mover::climb_energy(a.climb, &f.jet) + 4.0)
+                                    .min_by(|a, b| (dist2d(f.pos, a.ground) + 3.0 * a.climb).partial_cmp(&(dist2d(f.pos, b.ground) + 3.0 * b.climb)).unwrap_or(std::cmp::Ordering::Equal));
+                                let Some(a) = a else { continue };
+                                if cur.map_or(true, |c| !nav.is_main(c)) {
+                                    continue; // roof to roof: not worth the two hops
+                                }
+                                travel = dist2d(f.pos, a.ground) / speed + a.climb / 6.0 + 2.5 + dist2d(a.top, p) / speed;
+                                roof = true;
+                            } else {
+                                travel += 2.0; // we stand on a roof and it is on the ground: climb down
+                            }
+                        }
+                        // When the closing circle passes it (after the end: never).
+                        let leave = z.leaves_at([p[0], p[1]], 0.0).unwrap_or(end + 1.0);
+                        if leave < t + travel + if roof { 2.0 } else { 0.3 } {
+                            continue; // the circle is there before us
+                        }
+                        // taken by a mech that is nearer to it than we are
+                        if sit.foes.iter().any(|x| x.age < 1.5 && (x.pos[2] - p[2]).abs() < 6.0 && dist2d(x.pos, p) < spacing && dist2d(x.pos, p) < dist2d(f.pos, p)) {
+                            continue;
+                        }
+                        let mut score = leave - 0.03 * dc - 0.05 * travel - if roof { 1.5 } else { 0.0 };
+                        if let Some((c, _, _)) = self.seat {
+                            if dist2d(c, p) < 1.5 && (c[2] - p[2]).abs() < 2.0 {
+                                score += 0.4;
+                            }
+                        }
+                        if best.map_or(true, |b| score > b.0) {
+                            best = Some((score, p, roof));
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        let pick = match best {
+            Some((_, p, roof)) => (p, roof),
+            None => (nav.nearest_walkable(z.nc[0], z.nc[1])?, false),
+        };
+        self.seat = Some((pick.0, pick.1, t));
+        Some(pick)
     }
 
     /// A cube (or a wanted weapon) close enough to grab without walking into anyone:

@@ -146,6 +146,14 @@ tuning! {
     /// With the closing circle this close (s) or past us, walking in overrides keeping
     /// clear of lightning arcs.
     zone_force_s = 6.0,
+    /// Last circle: choose the standing spot by when the closing circle will pass it
+    /// (among the nav nodes within `final_seat_r` of the final point that no nearer mech
+    /// occupies) and boost to it; 0 = walk to the ground nearest to the final point.
+    final_seat = 1.0,
+    final_seat_r = 16.0,
+    /// ... roofs up to this many metres above the ground count as spots when we have
+    /// the jet energy for the hop (0 = ground only).
+    final_roof = 30.0,
     /// Aim to stand this far inside the next circle (capped at 35% of its radius).
     zone_inner_margin = 22.0,
     /// Energy kept back for emergencies when boosting for convenience.
