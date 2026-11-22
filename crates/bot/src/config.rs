@@ -140,6 +140,9 @@ tuning! {
     strafe_weight = 1.0,
     /// Start moving this many seconds before the closing circle would reach us.
     zone_margin_s = 9.0,
+    /// The margin grows with what the zone costs: x sqrt(zone dps / this), between 1
+    /// and 2 (0 = the same margin at 20 and at 260 HP/s).
+    zone_dps_ref = 45.0,
     /// With the closing circle this close (s) or past us, walking in overrides keeping
     /// clear of lightning arcs.
     zone_force_s = 6.0,

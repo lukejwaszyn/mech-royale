@@ -868,6 +868,15 @@ impl Bot {
         }
     }
 
+    /// Seconds before the closing circle reaches us at which we start walking. Being
+    /// late costs `dps` per second, thirteen times more in the last phase than in the
+    /// first: the margin grows with the square root of that (never below the base).
+    pub(crate) fn zone_margin(&self, f: &Frame) -> f32 {
+        let t = &self.tune;
+        let k = if t.zone_dps_ref > 0.0 { (f.zone.dps.max(0.0) / t.zone_dps_ref).sqrt().clamp(1.0, 2.0) } else { 1.0 };
+        t.zone_margin_s * k
+    }
+
     /// 0 = fine, 1 = should drift to safety when idle, 2 = go now.
     fn zone_need(&self, f: &Frame, obs: &Obs) -> u8 {
         let z = &f.zone;
@@ -886,7 +895,7 @@ impl Bot {
         let straight = ((f.xy[0] - z.nc[0]).hypot(f.xy[1] - z.nc[1]) - z.nr).max(0.0);
         let speed = me.stats.walk_speed.max(1.0);
         let detour = (walk - straight).max(0.0) / speed;
-        let margin = self.tune.zone_margin_s;
+        let margin = self.zone_margin(f);
         if leaves - f.t < margin + detour * 1.2 {
             return 2;
         }
