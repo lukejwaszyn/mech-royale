@@ -26,5 +26,7 @@ COPY --from=build /bot /bot
 RUN ["/bot", "--version"]
 # practice | ffa  (ffa = the final: free-for-all against other teams' bots)
 ENV MECH_MODE=practice
+# Comparison variant: tuning overrides for a practice run.
+ENV MECH_TUNE="retreat_hp=0.45,reengage_hp=0.8"
 USER 65534:65534
 ENTRYPOINT ["/bot"]
