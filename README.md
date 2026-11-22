@@ -62,10 +62,27 @@ upgrade preference table. Rule numbers are never hard-coded: they are read from
   answer has come by then it sends a *coasting* action for that tick (last move, boost,
   aim and triggers; no one-shots), so an answer is never late even if a decision is slow.
 
-A decision that panics is caught and answered with the same coasting action. A hello that
-does not parse, or a map that cannot be read, still gives a playing bot (on a flat world
-without walls). stdout carries protocol lines only; logs go to stderr, including decision
-times (a summary every 10 match-seconds and at exit).
+A decision that panics is caught and answered with the same coasting action. Input is read
+leniently and never trusted:
+
+* `hello` and observations are parsed strictly first; if that fails, every part is read
+  on its own (numbers sent as strings are read as numbers, a malformed section takes the
+  documented defaults, a malformed list element is dropped). Ids, slot, seed and counts
+  parse from `3`, `3.0` and `"3"`. One mistyped field costs that field, not the map or
+  the decision.
+* The map is looked for where `hello.map.dir` says and then in `/arena`; only without
+  either does the bot play on a flat world without walls.
+* Observations are sanitised before anything computes with them: things with non-finite
+  or absurd coordinates are dropped, speeds, angles, our own state and the zone are
+  clamped. (A shell at 1e9 m/s once sent a ray march into a loop that never ended.)
+* A brain that stays silent for 30 decisions after its init is taken for hung and
+  replaced by a fresh one built from the hello line (at most twice per match).
+* The early `ready` fallback (60% of the hello budget) counts from the arrival of hello.
+
+stdout carries protocol lines only. Logs go to stderr through one helper (`log.rs`) with a
+byte budget per process (48 KB; a normal match writes under 10 KB) that never panics on a
+closed or full pipe; `MECH_VERBOSE` output is not capped. `MECH_TEST_HANG_AT=<tick>` is a
+test hook (a decision that never returns) and is never set in a match.
 
 `model.rs` — what we believe: enemy tracks (position, raw and smoothed velocity, HP,
 weapons, last seen, clear line of fire, a duel record per enemy), remembered pickups,
@@ -176,7 +193,11 @@ inside arc range + 8 m the bot boosts away.
 
 **Shoot first, at what is coming** [+0.2]. A mech that walks towards us or lines us up
 inside `first_strike_range` is one of the squad on its way to shoot us; it is attacked
-before it opens fire (practice mode only). A mech in plain sight that one more burst will
+before it opens fire (practice mode only). Out to `first_strike_far` (190 m, capped at what
+we see) the same holds on clearer evidence: it has come straight at us for
+`first_strike_far_s`, or it comes with its guns on us. Both sides walk equally fast, so
+first contact is the longest range the fight will ever have, and a mech walking down the
+line needs no lead [+0.15 in the simulator, inside its noise]. A mech in plain sight that one more burst will
 finish is always shot (`kill_shot_range`). Having opened fire we stay on the target for
 `hunt_commit_s`: a hunt that stops when a condition flickers has only made an enemy.
 Bystanders that are neither attacking nor coming are still left alone and kept at
@@ -191,8 +212,17 @@ code (cover search, last stand) is still there and is used by the free-for-all p
 damage, which also blocks regeneration, and drops two cubes. Ignored drones used to kill
 a bot that was hiding from mechs.
 
-**Loot.** Cubes, crates, drones and supply drops as before, valued per second of walking;
-the current values are a local optimum in the simulator. A task is judged leniently once
+**Loot.** Cubes, crates, drones and supply drops are valued per second of walking, in
+cubes: a pile (a dead mech's cubes plus two lie together) is one trip worth all of them,
+and a pile of three or more gets the longer, bolder trip a laser gets; the cube that
+reaches the next upgrade threshold counts double (`cube_upgrade_bonus`); a drone is two
+cubes (`v_npc`), a crate one plus the chance of a laser while we have none
+(`v_crate`, `v_crate_laser`); supply drops are considered out to `drop_range` (they are
+announced 25 s ahead and stay until taken). During a fight a pile is fetched from up to
+twice as far as a single cube, on boost (`errand_pile`). A pickup or cube is only a task
+if there is a place to stand within its pickup radius and 3 m of height; the last metres
+go straight at the thing, and standing next to it for 4 s without getting it gives it up
+(once more after a minute, then for good). A task is judged leniently once
 chosen, so that a mech drifting near the goal does not send the bot back and forth. Loot
 outside the next circle is judged at the loot (will the circle have passed it when we get
 there?), never at where we stand — that rule used to flip as the bot crossed the line and
@@ -204,15 +234,39 @@ We leave when the closing edge would reach our position within a margin plus the
 the buildings force, and once on the way in we keep going until properly inside, fight or
 no fight. Inside the next circle there is nothing to do, at any depth (a ring a few
 metres inside the rim used to ask for a walk further in while the rim itself did not, and
-a bot idling there paced across that line). In the last phase the circle closes to
-nothing: the bot goes to the centre and stays there. In the simulator the rim is the
+a bot idling there paced across that line). The margin grows with what the zone costs
+(x sqrt(dps / 45), up to x2). In the last phase the circle closes to nothing, and what
+decides the order of death is how long each mech stands outside it at 260 HP/s. The
+circle closes on the final point from where its centre is now, so a spot on that side
+stays inside seconds longer per metre than one on the far side, and the point itself goes
+to one mech (bodies are pushed apart). The bot therefore takes, among the places to stand
+within `final_seat_r` of the final point that no nearer mech occupies, the one the circle
+passes last, re-chosen twice a second, and boosts there; a roof over the final point
+counts when it is at most `final_roof` metres up and the jet energy is there. Outside the
+circle it runs straight for the circle's current centre. In the simulator the rim is the
 safer place to fight (the squad gathers inside): a pull towards the centre while kiting
 cost up to 0.8 points and was removed.
 
 **Roofs.** A hop that does not arrive (the jump never leaves the ground, the jet is
 stopped) is counted against its access point; after two failures that access is not used
 again in the match, and loot on a roof with no access left is ignored. Before, the bot
-jumped at one wall for a minute and a half, one loot item after the other.
+jumped at one wall for a minute and a half, one loot item after the other. The same now
+holds on the way down or out of a yard or the stadium bowl: a failed exit is not tried
+again while another is left, and after three failed exits in a row the bot walks straight
+at its goal for a few seconds so that stuck recovery (jump, sidestep, jump and jet) gets
+a turn. Waiting for jet energy at the foot of a wall is no longer a standstill: the bot
+strafes and dodges around the spot, never boosts for convenience meanwhile, and a wait
+that outlasts the energy it needs counts as a failed hop.
+
+**Upgrades.** Two tables (`config.rs`). In the practice run damage comes before
+regeneration: the drum magazine is +31% sustained gun damage (20 rounds, 1.92 s reload),
+tungsten rounds +15%, the rotary feed +8%; the lens +18% laser damage, fast capacitors
++8.5%. The free-for-all table (max HP, regeneration, armor first) is unchanged.
+
+**Laser against mortar carriers.** The kill estimates (release an early charge, take the
+kill shot, finish before turning to an unseen attacker) count the +60% cook-off against a
+mech that holds a mortar and x1.5 into a turned back; with a laser in hand such a mech
+gets a small target bonus (`cookoff_bonus`).
 
 **Free-for-all (`MECH_MODE=ffa`).** For the final against other teams' bots: never starts
 a fight with a healthy mech, only finishes weak ones; retreats to cover when hurt or
@@ -286,8 +340,9 @@ Open problems, largest first:
   once per phase (seven times per match). On a slow or loaded host that one decision can
   pass the bot's own 30 ms deadline and go out as a coasting answer - never late, but a
   wasted tick. Building the field on a helper thread would remove it.
-* The final centre is taken as the nearest walkable ground; a roof over the centre is not
-  used.
+* The last-circle rules (spot by exit time, boost, roof over the final point) are only
+  checked in sixteen-copy simulator matches; the roof hop in particular has never been
+  seen on the real server.
 
 Things to look at after the first real practice score:
 

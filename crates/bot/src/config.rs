@@ -70,6 +70,12 @@ tuning! {
     /// attacked before it opens fire (0 = off), while our HP fraction is at least `first_strike_hp`.
     first_strike_range = 130.0,
     first_strike_hp = 0.5,
+    /// ... and out to this distance (capped at what we can see) a mech that has been
+    /// coming straight at us for `first_strike_far_s` seconds, or that comes with its
+    /// guns on us (0 = off). At equal walking speed the first contact is the longest
+    /// range the fight will ever have: a hunter walking in is a target that needs no lead.
+    first_strike_far = 190.0,
+    first_strike_far_s = 1.5,
     /// Having opened fire on a mech we stay on it at least this long (s).
     hunt_commit_s = 6.0,
 
@@ -134,9 +140,20 @@ tuning! {
     strafe_weight = 1.0,
     /// Start moving this many seconds before the closing circle would reach us.
     zone_margin_s = 9.0,
+    /// The margin grows with what the zone costs: x sqrt(zone dps / this), between 1
+    /// and 2 (0 = the same margin at 20 and at 260 HP/s).
+    zone_dps_ref = 45.0,
     /// With the closing circle this close (s) or past us, walking in overrides keeping
     /// clear of lightning arcs.
     zone_force_s = 6.0,
+    /// Last circle: choose the standing spot by when the closing circle will pass it
+    /// (among the nav nodes within `final_seat_r` of the final point that no nearer mech
+    /// occupies) and boost to it; 0 = walk to the ground nearest to the final point.
+    final_seat = 1.0,
+    final_seat_r = 16.0,
+    /// ... roofs up to this many metres above the ground count as spots when we have
+    /// the jet energy for the hop (0 = ground only).
+    final_roof = 30.0,
     /// Aim to stand this far inside the next circle (capped at 35% of its radius).
     zone_inner_margin = 22.0,
     /// Energy kept back for emergencies when boosting for convenience.
@@ -175,9 +192,20 @@ tuning! {
     w_lightning = 4.0,
     w_mortar = 9.0,
     v_cube = 6.0,
-    v_crate = 5.0,
-    v_npc = 6.5,
+    /// A crate is one cube (plus `v_crate_laser` for the weapon it may hold while we
+    /// have no laser); a drone is two cubes for a few seconds of gun fire.
+    v_crate = 6.0,
+    v_crate_laser = 5.0,
+    v_npc = 12.0,
     v_drop = 24.0,
+    /// Cubes lying together (a dead mech's pile) count as one trip worth all of them
+    /// (0 = every cube on its own), and the cube that reaches the next upgrade threshold
+    /// counts this many cubes extra - also for drones, crates and supply drops.
+    cube_pile = 1.0,
+    cube_upgrade_bonus = 1.0,
+    /// Supply drops are looked at out to this distance (they are announced 25 s ahead
+    /// and never go away): 3 cubes, full HP and full energy.
+    drop_range = 350.0,
     /// Upgrade choice: added to the table weight of the laser damage / charge upgrades and
     /// of the gun upgrades (the table puts max HP and armor first).
     up_laser = 0.0,
@@ -198,6 +226,9 @@ tuning! {
     errand_clear = 40.0,
     /// Target choice: extra weight for a mech that carries a laser.
     laser_carrier_bonus = 1.0,
+    /// ... and, while we hold a laser, for one that carries a mortar (cook-off: our
+    /// laser hits it 60% harder).
+    cookoff_bonus = 0.6,
     /// While we hold no laser at all: start no fight with a mech further away than this
     /// (0 = no such limit). A gun duel takes twice as long and draws others in.
     no_laser_strike_range = 0.0,
@@ -208,8 +239,11 @@ tuning! {
     /// this fraction of our distance to it.
     errand_keep = 55.0,
     errand_keep_frac = 0.6,
-    /// ... cubes within this fraction of `errand_range`.
+    /// ... cubes within this fraction of `errand_range`,
     errand_cube_frac = 0.25,
+    /// ... a pile of n cubes within (1 + this x (n - 1), at most x2) as far, on boost
+    /// while there is energy to spare.
+    errand_pile = 0.5,
     /// A cube is fetched (outside fights) unless a mech we are not fighting stands
     /// within this distance of it.
     cube_keep = 90.0,
@@ -257,8 +291,35 @@ pub const UPGRADE_WEIGHTS: &[(&str, f32)] = &[
     ("laser_pierce", 2.0),
 ];
 
+/// Entries that replace the table above in the practice run. There one squad hunts us
+/// and kills are the points: damage upgrades act at once and shorten every later fight,
+/// while regeneration needs 5 s without dealing or taking damage. By the rule numbers
+/// (sustained fire): the drum magazine (20 rounds, 1.92 s reload) is +31% gun damage per
+/// second, tungsten rounds +15%, the rotary feed +8% (the reload dominates); the lens
+/// +18% laser damage, fast capacitors +8.5% (cycle 2.4 -> 2.21 s).
+pub const UPGRADE_WEIGHTS_PRACTICE: &[(&str, f32)] = &[
+    ("plating", 10.0),
+    ("gun_mag", 9.5),
+    ("laser_damage", 9.0),
+    ("gun_damage", 8.5),
+    ("armor", 8.0),
+    ("laser_charge", 7.5),
+    ("gun_rate", 6.5),
+    ("nanites", 6.0),
+];
+
 pub fn upgrade_weight(id: &str) -> f32 {
     UPGRADE_WEIGHTS.iter().find(|(k, _)| *k == id).map(|(_, w)| *w).unwrap_or(1.0)
+}
+
+/// The weight for the mode being played (`ffa` = the free-for-all table above).
+pub fn upgrade_weight_for(id: &str, ffa: bool) -> f32 {
+    if !ffa {
+        if let Some((_, w)) = UPGRADE_WEIGHTS_PRACTICE.iter().find(|(k, _)| *k == id) {
+            return *w;
+        }
+    }
+    upgrade_weight(id)
 }
 
 impl Tuning {
@@ -326,5 +387,18 @@ mod tests {
         assert!(t.ffa);
         assert_eq!(bad, vec!["nope=1".to_string(), "x".to_string()]);
         assert!(Tuning::names().contains(&"zone_margin_s"));
+    }
+
+    /// The practice table follows the arithmetic of sustained fire; the free-for-all
+    /// table is the general one.
+    #[test]
+    fn upgrade_tables_by_mode() {
+        let p = |id| upgrade_weight_for(id, false);
+        assert!(p("plating") > p("gun_mag") && p("gun_mag") > p("gun_damage") && p("gun_damage") > p("gun_rate"));
+        assert!(p("laser_damage") > p("laser_charge") && p("gun_mag") > p("nanites"));
+        assert_eq!(p("servos"), upgrade_weight("servos"));
+        for (id, w) in UPGRADE_WEIGHTS {
+            assert_eq!(upgrade_weight_for(id, true), *w);
+        }
     }
 }

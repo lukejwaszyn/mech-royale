@@ -17,6 +17,15 @@ pub enum TaskKind {
     Drop(i64),
 }
 
+/// For things we shoot or stand in the ring of (crates, drones, supply drops): a place
+/// to stand somewhere near is enough.
+const STAND_ANY: (f32, f32) = (6.0, f32::INFINITY);
+/// Standing this close to a thing we came to pick up, for this long, without getting it:
+/// give it up (for `GIVE_UP_S`; the second time for good).
+const STALL_DIST: f32 = 8.0;
+const STALL_S: f32 = 4.0;
+const GIVE_UP_S: f32 = 60.0;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Task {
     pub kind: TaskKind,
@@ -76,13 +85,41 @@ impl Bot {
 
     /// Score of going to `pos` for `value`: value per second, or None if out of reach.
     fn eval_task(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32) -> Option<(f32, bool)> {
-        self.eval_task_in(f, obs, sit, pos, value, extra_s, self.tune.loot_range, self.tune.avoid_range * 0.9)
+        self.eval_task_in(f, obs, sit, pos, value, extra_s, self.tune.loot_range, self.tune.avoid_range * 0.9, STAND_ANY)
+    }
+
+    /// How many cubes lie together at `pos` (a dead mech's pile is one trip), at most
+    /// the `room` we have left below the cap.
+    pub(crate) fn pile_at(&self, pos: V3, room: f32) -> f32 {
+        if self.tune.cube_pile <= 0.0 {
+            return 1.0;
+        }
+        (self.model.cubes.iter().filter(|o| dist2d(o.pos, pos) < 8.0 && (o.pos[2] - pos[2]).abs() < 4.0).count() as f32).min(room).max(1.0)
+    }
+
+    /// Worth of gaining `n` cubes when we hold `have`, in cubes: `n`, plus a bonus when
+    /// that reaches the next entry of `cubes.upgrade_thresholds` (an upgrade on top).
+    pub(crate) fn cube_gain(&self, have: f32, n: f32) -> f32 {
+        let next = self.cfg.cubes.upgrade_thresholds.iter().copied().find(|th| *th > have + 0.5);
+        n + if next.map_or(false, |th| have + n >= th - 0.01) { self.tune.cube_upgrade_bonus } else { 0.0 }
+    }
+
+    /// How close we must be able to stand to a weapon pickup / a cube to get it:
+    /// (horizontal distance from the nearest place to stand, height difference).
+    /// `take` works within `loot.pickup_radius` and 4 m of height (protocol 6), cubes
+    /// come within `cubes.pickup_radius` and 4 m (protocol 10). The half metre on top
+    /// is what walking straight at the thing can gain over the nav node's centre.
+    pub(crate) fn stand_pickup(&self) -> (f32, f32) {
+        (self.cfg.loot.pickup_radius + 0.5, 3.0)
+    }
+    pub(crate) fn stand_cube(&self) -> (f32, f32) {
+        (self.cfg.cubes.pickup_radius + 0.5, 3.0)
     }
 
     /// As [`Self::eval_task`], with the search radius and the distance to keep from
     /// mechs we are not fighting given explicitly (a laser is worth a longer, bolder trip).
     #[allow(clippy::too_many_arguments)]
-    fn eval_task_in(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32, range: f32, keep: f32) -> Option<(f32, bool)> {
+    fn eval_task_in(&self, f: &Frame, obs: &Obs, sit: &Sit, pos: V3, value: f32, extra_s: f32, range: f32, keep: f32, stand: (f32, f32)) -> Option<(f32, bool)> {
         let d = dist2d(pos, f.pos);
         if d > range || value <= 0.0 {
             return None;
@@ -101,8 +138,12 @@ impl Bot {
         if d > 3.0 {
             let n = nav.nearest_node(pos)?;
             let np = nav.node_pos(n);
-            if dist2d(np, pos) > 6.0 {
-                return None; // nowhere to stand near it
+            // Nowhere to stand within reach of it: beside a wall or in an alley too
+            // narrow for us, or on a ledge with no room to stand whose nearest node is
+            // the ground below. (The bot used to walk to the end of the path and stand
+            // there, the thing 5 m away or 6 m overhead, for 40 s at a time.)
+            if dist2d(np, pos) > stand.0 || (np[2] - pos[2]).abs() > stand.1 {
+                return None;
             }
             if !nav.is_main(n) {
                 // on a roof, a deck or in an enclosed yard: needs a hop
@@ -144,8 +185,11 @@ impl Bot {
             return None;
         }
         let mut best: Option<(f32, V3, bool)> = None;
-        for p in self.model.pickups.iter().filter(|p| p.kind == "laser" && !self.model.bad_pickups.contains(&p.id)) {
-            if let Some((score, climb)) = self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, self.tune.laser_range, self.tune.laser_keep) {
+        // (Not one the task planner has given up on for now: an out-of-reach laser used
+        // to pull the legs to its spot in every fight and hold back every hunt.)
+        let black = |id: i64| self.task_black.iter().any(|(k, until)| *k == TaskKind::Pickup(id) && *until > f.t);
+        for p in self.model.pickups.iter().filter(|p| p.kind == "laser" && !self.model.bad_pickups.contains(&p.id) && !black(p.id)) {
+            if let Some((score, climb)) = self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, self.tune.laser_range, self.tune.laser_keep, self.stand_pickup()) {
                 if best.map_or(true, |b| score > b.0) {
                     best = Some((score, p.pos, climb));
                 }
@@ -191,9 +235,14 @@ impl Bot {
             // keep-away distance of our goal must not send us back and forth).
             let current = self.task.map_or(false, |c| c.kind == kind);
             let r = if r.is_none() && current {
-                let prize = matches!(kind, TaskKind::Pickup(id) if self.model.pickups.iter().any(|p| p.id == id && p.kind == "laser"));
+                let prize = matches!(kind, TaskKind::Pickup(id) if self.model.pickups.iter().any(|p| p.id == id && p.kind == "laser")) || matches!(kind, TaskKind::Cube(_));
                 let (range, keep) = if prize { (tune.laser_range, tune.laser_keep) } else { (tune.loot_range, tune.avoid_range * 0.9) };
-                self.eval_task_in(f, obs, sit, pos, self.task.map_or(1.0, |c| c.score.max(0.05)), 0.0, range * 1.25, keep * 0.55).map(|(_, climb)| (self.task.map_or(0.1, |c| c.score / 1.35), climb))
+                let stand = match kind {
+                    TaskKind::Pickup(_) => self.stand_pickup(),
+                    TaskKind::Cube(_) => self.stand_cube(),
+                    _ => STAND_ANY,
+                };
+                self.eval_task_in(f, obs, sit, pos, self.task.map_or(1.0, |c| c.score.max(0.05)), 0.0, range * 1.25, keep * 0.55, stand).map(|(_, climb)| (self.task.map_or(0.1, |c| c.score / 1.35), climb))
             } else {
                 r
             };
@@ -213,36 +262,50 @@ impl Bot {
             }
             let (gain, _) = self.pickup_gain(f, sit, weapon_bit(&p.kind));
             if gain > 0.5 {
-                let r = if p.kind == "laser" { self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, tune.laser_range, tune.laser_keep) } else { self.eval_task(f, obs, sit, p.pos, gain, 0.5) };
+                let (range, keep) = if p.kind == "laser" { (tune.laser_range, tune.laser_keep) } else { (tune.loot_range, tune.avoid_range * 0.9) };
+                let r = self.eval_task_in(f, obs, sit, p.pos, gain, 0.5, range, keep, self.stand_pickup());
                 offer(TaskKind::Pickup(p.id), p.pos, r);
             }
         }
         if want_cubes {
+            // Each cube is +4% HP (healed at once) and damage; every cube of a pile is
+            // offered at the pile's worth, so a dead mech's five cubes are not priced
+            // like one cube - and a pile of three or more is worth the longer, bolder
+            // trip we make for a laser.
+            let room = (tune.max_cubes - me.cubes).max(1.0);
             for c in &self.model.cubes {
-                offer(TaskKind::Cube(c.id), c.pos, self.eval_task_in(f, obs, sit, c.pos, tune.v_cube, 0.0, tune.loot_range, tune.cube_keep));
+                let n = self.pile_at(c.pos, room);
+                let (range, keep) = if n >= 3.0 { (tune.laser_range, tune.laser_keep.min(tune.cube_keep)) } else { (tune.loot_range, tune.cube_keep) };
+                offer(TaskKind::Cube(c.id), c.pos, self.eval_task_in(f, obs, sit, c.pos, tune.v_cube * self.cube_gain(me.cubes, n), 0.0, range, keep, self.stand_cube()));
             }
         }
+        let up = |n: f32| tune.v_cube * (self.cube_gain(me.cubes, n) - n);
         // No laser and none known: looking for one may be worth more than farming.
         let searching = !f.has(W_LASER) && !self.model.pickups.iter().any(|p| p.kind == "laser");
         let farm_mult = if searching { tune.nolaser_farm_mult } else { 1.0 };
         if farm_ok {
             let special_full = f.slots.iter().all(|s| s.is_some());
             for c in &self.model.crates {
-                let v = farm_mult * tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
+                // one cube, and half the time a weapon: a laser one time in three of those
+                let weapon = if f.has(W_LASER) { 0.0 } else { tune.v_crate_laser };
+                let v = farm_mult * if want_cubes { tune.v_crate + up(self.cfg.crates.cubes) + weapon } else if special_full { 0.0 } else { 0.5 * tune.v_crate + weapon };
                 offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0));
             }
             if want_cubes {
                 for tr in self.model.tracks.iter().filter(|x| x.npc && t - x.seen_t < 4.0) {
-                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, farm_mult * tune.v_npc, tr.hp / gun_dps + 3.0));
+                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, farm_mult * (tune.v_npc + up(self.cfg.npc.cubes)), tr.hp / gun_dps + 3.0));
                 }
             }
         }
         for d in &obs.drops {
             let travel = dist2d(d.pos, f.pos) * 1.3 / me.stats.walk_speed.max(1.0);
             let contested = sit.foes.iter().any(|x| x.age < 5.0 && dist2d(x.pos, d.pos) < 60.0);
-            let v = tune.v_drop * (1.0 + (1.0 - f.hp_frac)) * if contested { 0.3 } else { 1.0 };
+            let v = (tune.v_drop * (1.0 + (1.0 - f.hp_frac)) + if want_cubes { up(self.cfg.drops.cubes) } else { 0.0 }) * if contested { 0.3 } else { 1.0 };
             let wait = (d.lands_in - travel).max(0.0) + d.capture_s;
-            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, sit, d.pos, v, wait));
+            // (Its own reach: announced 25 s before it lands and never withdrawn, it is
+            // worth a longer walk than the cube next door - the general 170 m cap used
+            // to hide most drops from the value formula altogether.)
+            offer(TaskKind::Drop(d.id), d.pos, self.eval_task_in(f, obs, sit, d.pos, v, wait, tune.drop_range.max(tune.loot_range), tune.avoid_range * 0.9, STAND_ANY));
         }
         if best.map(|b| b.kind) != self.task.map(|b| b.kind) {
             self.task_started = t;
@@ -270,8 +333,8 @@ impl Bot {
         }
         let world = self.world.clone();
         let mut it = match task.kind {
-            TaskKind::Pickup(_) => Intent::new(Mode::Loot, self.drive_to_task(f, obs, task.pos, 1.0, task.climb), 2.0),
-            TaskKind::Cube(_) => Intent::new(Mode::Loot, self.drive_to_task(f, obs, task.pos, 0.4, task.climb), 2.0),
+            TaskKind::Pickup(_) => Intent::new(Mode::Loot, self.drive_to_item(f, obs, task.pos, 1.0, task.climb), 2.0),
+            TaskKind::Cube(_) => Intent::new(Mode::Loot, self.drive_to_item(f, obs, task.pos, 0.4, task.climb), 2.0),
             TaskKind::Crate(id) => {
                 let c = self.model.crates.iter().find(|c| c.id == id)?.pos;
                 let aim_pt = [c[0], c[1], c[2] + self.cfg.crates.height * 0.5];
@@ -329,8 +392,58 @@ impl Bot {
         self.mover.drive(nav, &obs.me, goal, arrive_r, f.t, &f.jet, climb, f.can_plan())
     }
 
+    /// Standing next to the thing the legs came for without getting it (the nav node is
+    /// further from it than the pickup radius, a wall is in the way, the server sees it
+    /// elsewhere): after a few seconds give it up, so that nothing can hold the bot on
+    /// one spot. It gets a second chance a minute later; after that it is left for good.
+    fn note_stall(&mut self, f: &Frame, obs: &Obs, intent: &Intent) {
+        let t = f.t;
+        for g in self.gave_up.iter_mut().filter(|g| g.2 < 2 && t >= g.1) {
+            self.model.bad_pickups.retain(|id| *id != g.0);
+            self.model.bad_cubes.retain(|id| *id != g.0);
+            g.1 = f32::INFINITY;
+        }
+        let near = |p: V3| dist2d(p, f.pos) < STALL_DIST && (p[2] - f.pos[2]).abs() <= 4.0;
+        let id = match self.leg_goal {
+            Some(g) if obs.me.grounded && !self.mover.hopping() && !intent.drive.waiting => self
+                .model
+                .pickups
+                .iter()
+                .filter(|p| !self.model.bad_pickups.contains(&p.id))
+                .map(|p| (p.id, p.pos))
+                .chain(self.model.cubes.iter().map(|c| (c.id, c.pos)))
+                .find(|(_, p)| dist2d(*p, g) < 1.0 && (p[2] - g[2]).abs() < 1.0 && near(*p))
+                .map(|(id, _)| id),
+            _ => None,
+        };
+        let Some(id) = id else {
+            self.stall = (-1, 0.0);
+            return;
+        };
+        if self.stall.0 != id {
+            self.stall = (id, 0.0);
+        }
+        self.stall.1 += f.dt;
+        if self.stall.1 < STALL_S {
+            return;
+        }
+        self.stall = (-1, 0.0);
+        if self.model.cubes.iter().any(|c| c.id == id) {
+            self.model.cubes.retain(|c| c.id != id);
+            self.model.bad_cubes.push(id);
+        } else if !self.model.bad_pickups.contains(&id) {
+            self.model.bad_pickups.push(id);
+        }
+        match self.gave_up.iter_mut().find(|g| g.0 == id) {
+            Some(g) => *g = (id, t + GIVE_UP_S, g.2 + 1),
+            None => self.gave_up.push((id, t + GIVE_UP_S, 1)),
+        }
+        self.task = None;
+    }
+
     /// `take` / `drop` for a wanted pickup in reach.
-    pub(crate) fn loot_actions(&mut self, f: &Frame, _obs: &Obs, sit: &Sit) -> (Option<i64>, Option<u32>) {
+    pub(crate) fn loot_actions(&mut self, f: &Frame, obs: &Obs, sit: &Sit, intent: &Intent) -> (Option<i64>, Option<u32>) {
+        self.note_stall(f, obs, intent);
         let t = f.t;
         if t - self.take_t < 0.25 {
             return (None, None);

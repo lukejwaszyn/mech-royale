@@ -11,7 +11,7 @@ use crate::mover::{Drive, Mover};
 use crate::proto::*;
 use std::sync::Arc;
 use std::time::Instant;
-use world::{Body, DistField, JetParams, Nav, NavParams, World};
+use world::{max_climb, Body, DistField, JetParams, Nav, NavParams, World};
 
 /// Cube counts the nav grids are built for (a mech grows 5% per cube).
 const NAV_TIERS: [f32; 5] = [0.0, 2.0, 5.0, 9.0, 14.0];
@@ -280,6 +280,16 @@ pub struct Diag {
     /// First contacts closer than 60 m by what we were doing: fight, loot, hold, other.
     pub contact_close: [f32; 4],
     contacted: Vec<i64>,
+    /// The state at the last decision (at death, when the match ends with it): mechs
+    /// attacking us, of those within 60 m, the nearest attacker's distance, known mechs
+    /// within 150 m, the target's distance and whether it was in the line of fire, our
+    /// HP then and 5 / 10 / 20 s earlier (percent of max), energy, weapons (bits: 2
+    /// mortar, 4 laser, 8 lightning), mode (0 final .. 5 hold), in the zone.
+    pub end: [f32; 14],
+    /// Match time of our first eight kills.
+    pub kill_t: [f32; 8],
+    hp_hist: std::collections::VecDeque<(f32, f32)>,
+    kills_seen: usize,
 }
 
 impl Diag {
@@ -345,6 +355,28 @@ impl Diag {
             ("contact60_loot", self.contact_close[1]),
             ("contact60_hold", self.contact_close[2]),
             ("contact60_other", self.contact_close[3]),
+            ("end_engaged", self.end[0]),
+            ("end_engaged60", self.end[1]),
+            ("end_att_dist", self.end[2]),
+            ("end_foes150", self.end[3]),
+            ("end_tgt_dist", self.end[4]),
+            ("end_tgt_los", self.end[5]),
+            ("end_hp", self.end[6]),
+            ("end_hp5", self.end[7]),
+            ("end_hp10", self.end[8]),
+            ("end_hp20", self.end[9]),
+            ("end_energy", self.end[10]),
+            ("end_weapons", self.end[11]),
+            ("end_mode", self.end[12]),
+            ("end_in_zone", self.end[13]),
+            ("kill_t1", self.kill_t[0]),
+            ("kill_t2", self.kill_t[1]),
+            ("kill_t3", self.kill_t[2]),
+            ("kill_t4", self.kill_t[3]),
+            ("kill_t5", self.kill_t[4]),
+            ("kill_t6", self.kill_t[5]),
+            ("kill_t7", self.kill_t[6]),
+            ("kill_t8", self.kill_t[7]),
         ]
     }
 }
@@ -390,6 +422,8 @@ pub struct Bot {
     hide_inside: bool,
     /// Spot that hides us from the other attackers while we fight one: (place, chosen at).
     split: Option<(V3, f32)>,
+    /// Standing spot in the last circle: (place, it is on a roof, chosen at).
+    seat: Option<(V3, bool, f32)>,
     // tasks (tasks.rs)
     pub(crate) task: Option<crate::tasks::Task>,
     pub(crate) task_t: f32,
@@ -397,6 +431,12 @@ pub struct Bot {
     pub(crate) task_black: Vec<(crate::tasks::TaskKind, f32)>,
     pub(crate) take_t: f32,
     pub(crate) take_tries: (i64, u32),
+    /// Where the legs are being sent this decision, when it is a thing to pick up.
+    pub(crate) leg_goal: Option<V3>,
+    /// The thing we stand next to without getting it (id, seconds), and the things given
+    /// up that way: (id, try again at, times).
+    pub(crate) stall: (i64, f32),
+    pub(crate) gave_up: Vec<(i64, f32, u32)>,
     // gunnery (gunnery.rs)
     pub(crate) last_aim: V2,
     pub(crate) scan_base: f32,
@@ -413,6 +453,9 @@ pub struct Bot {
     kite_boost: bool,
     /// Diagnostics: which branch of `plan_fight` moved the legs.
     fight_kind: u8,
+    /// Diagnostics of the last steering decision (MECH_VERBOSE): lightning arcs avoided,
+    /// other mechs avoided, hard drive, drive direction.
+    steer_dbg: (usize, usize, bool, V2),
     prev_mode: Mode,
     last_t: f32,
     last_mode_log: f32,
@@ -516,12 +559,16 @@ impl Bot {
             zone_run: false,
             hide_inside: false,
             split: None,
+            seat: None,
             task: None,
             task_t: -1e9,
             task_started: -1e9,
             task_black: Vec::new(),
             take_t: -1e9,
             take_tries: (-1, 0),
+            leg_goal: None,
+            stall: (-1, 0.0),
+            gave_up: Vec::new(),
             last_aim: [0.0, 0.0],
             scan_base: 0.0,
             mortar_aim_until: -1e9,
@@ -531,6 +578,7 @@ impl Bot {
             boosting: false,
             kite_boost: false,
             fight_kind: 0,
+            steer_dbg: (0, 0, false, [0.0, 0.0]),
             prev_mode: Mode::Hold,
             last_t: 0.0,
             last_mode_log: -1e9,
@@ -610,7 +658,7 @@ impl Bot {
         self.mode = intent.mode;
         let (mv, boost, jump) = self.steer(&f, obs, &sit, &intent);
         let (aim, fire, reload) = self.gunnery(&f, obs, &sit, &intent, mv);
-        let (take, drop) = self.loot_actions(&f, obs, &sit);
+        let (take, drop) = self.loot_actions(&f, obs, &sit, &intent);
         let pick = self.pick_upgrade(&f, obs);
         self.last_aim = aim;
         self.note_diag(&f, obs, &sit, &intent, mv, fire, reload, boost);
@@ -645,10 +693,11 @@ impl Bot {
             let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
             let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
             crate::vlogln!(
-                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} task={}",
+                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} steer(arcs={} others={} hard={} dir={:.1},{:.1} wait={} hop={} rec={} g={}) task={}",
                 obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
                 obs.me.in_zone, need_dbg, f.zone.r - (f.xy[0] - f.zone.c[0]).hypot(f.xy[1] - f.zone.c[1]), f.zone.nr - (f.xy[0] - f.zone.nc[0]).hypot(f.xy[1] - f.zone.nc[1]), f.zone.t1,
                 sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining,
+                self.steer_dbg.0, self.steer_dbg.1, self.steer_dbg.2, self.steer_dbg.3[0], self.steer_dbg.3[1], intent.drive.waiting, self.mover.hopping(), self.mover.recovering(obs.t), obs.me.grounded,
                 self.task.map(|k| format!("{:?}@({:.0},{:.0},{:.0}) s={:.2}", k.kind, k.pos[0], k.pos[1], k.pos[2], k.score)).unwrap_or_default()
             );
         }
@@ -680,7 +729,45 @@ impl Bot {
         let cubes_known = self.model.cubes.len() as f32;
         let cube_near = self.model.cubes.iter().map(|c| dist2d(c.pos, f.pos)).fold(f32::INFINITY, f32::min);
         let max_cubes = self.tune.max_cubes;
+        let kills_now = self.model.kills as usize;
         let d = &mut self.diag;
+        // the state at this decision (the last one is the state at death)
+        let pct = 100.0 / obs.me.max_hp.max(1.0);
+        d.hp_hist.push_back((f.t, obs.me.hp * pct));
+        while d.hp_hist.front().map_or(false, |x| f.t - x.0 > 21.0) {
+            d.hp_hist.pop_front();
+        }
+        let hp_ago = |h: &std::collections::VecDeque<(f32, f32)>, s: f32| h.iter().find(|x| f.t - x.0 <= s).map_or(0.0, |x| x.1);
+        let att: Vec<&Foe> = sit.foes.iter().filter(|x| x.engaged).collect();
+        d.end = [
+            att.len() as f32,
+            att.iter().filter(|x| x.dist < 60.0).count() as f32,
+            att.iter().map(|x| x.dist).fold(f32::INFINITY, f32::min).min(999.0),
+            sit.foes.iter().filter(|x| x.age < 3.0 && x.dist < 150.0).count() as f32,
+            sit.target.map_or(0.0, |x| x.dist),
+            sit.target.map_or(0.0, |x| x.los as u8 as f32),
+            obs.me.hp * pct,
+            hp_ago(&d.hp_hist, 5.0),
+            hp_ago(&d.hp_hist, 10.0),
+            hp_ago(&d.hp_hist, 20.0),
+            obs.me.energy,
+            f.slots.iter().flatten().filter(|s| s.bit != W_GUN).fold(0u8, |a, s| a | s.bit) as f32,
+            match intent.mode {
+                Mode::Final => 0.0,
+                Mode::Zone => 1.0,
+                Mode::Retreat => 2.0,
+                Mode::Fight => 3.0,
+                Mode::Loot => 4.0,
+                Mode::Hold => 5.0,
+            },
+            obs.me.in_zone as u8 as f32,
+        ];
+        while d.kills_seen < kills_now {
+            if d.kills_seen < 8 {
+                d.kill_t[d.kills_seen] = f.t;
+            }
+            d.kills_seen += 1;
+        }
         d.cubes = obs.me.cubes;
         d.cubes_left = cubes_known;
         if cubes_known > 0.0 && obs.me.cubes < max_cubes {
@@ -859,6 +946,15 @@ impl Bot {
         }
     }
 
+    /// Seconds before the closing circle reaches us at which we start walking. Being
+    /// late costs `dps` per second, thirteen times more in the last phase than in the
+    /// first: the margin grows with the square root of that (never below the base).
+    pub(crate) fn zone_margin(&self, f: &Frame) -> f32 {
+        let t = &self.tune;
+        let k = if t.zone_dps_ref > 0.0 { (f.zone.dps.max(0.0) / t.zone_dps_ref).sqrt().clamp(1.0, 2.0) } else { 1.0 };
+        t.zone_margin_s * k
+    }
+
     /// 0 = fine, 1 = should drift to safety when idle, 2 = go now.
     fn zone_need(&self, f: &Frame, obs: &Obs) -> u8 {
         let z = &f.zone;
@@ -877,7 +973,7 @@ impl Bot {
         let straight = ((f.xy[0] - z.nc[0]).hypot(f.xy[1] - z.nc[1]) - z.nr).max(0.0);
         let speed = me.stats.walk_speed.max(1.0);
         let detour = (walk - straight).max(0.0) / speed;
-        let margin = self.tune.zone_margin_s;
+        let margin = self.zone_margin(f);
         if leaves - f.t < margin + detour * 1.2 {
             return 2;
         }
@@ -923,6 +1019,15 @@ impl Bot {
         // duel clocks: time it spent shooting at us, time we spent shooting at it
         for foe in &sit.foes {
             let tr = &mut self.model.tracks[foe.ti];
+            // coming straight at us (most of its walking speed along the line to us)
+            let closing = dot2([tr.vel_s[0], tr.vel_s[1]], norm2([f.xy[0] - tr.pos[0], f.xy[1] - tr.pos[1]]));
+            if tr.in_obs && closing > 0.75 * self.cfg.mech.walk_speed {
+                if tr.closing_since < 0.0 {
+                    tr.closing_since = t;
+                }
+            } else {
+                tr.closing_since = -1.0;
+            }
             if foe.engaged && foe.los {
                 tr.their_time += f.dt;
             }
@@ -958,6 +1063,10 @@ impl Bot {
             // A laser carrier is the most dangerous of them, and it drops the laser we lack.
             if foe.weapons & W_LASER != 0 {
                 s += if f.has(W_LASER) { tune.laser_carrier_bonus * 0.4 } else { tune.laser_carrier_bonus };
+            }
+            // Our laser sets off a carried mortar: such a mech dies a third sooner.
+            if foe.weapons & W_MORTAR != 0 && f.has(W_LASER) {
+                s += tune.cookoff_bonus;
             }
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, *foe));
@@ -1018,23 +1127,26 @@ impl Bot {
                 && ((weak && f.hp_frac >= tune.retreat_hp + 0.1) || (stronger && tg.los && f.hp_frac >= tune.hunt_min_hp && !tune.ffa));
             // A kill within reach is a place gained whatever else is going on: a mech in
             // plain sight that a few more hits will finish.
-            let burst = f.slots.iter().flatten().map(|s| match s.bit {
-                W_LASER if s.cooldown < 1.0 => s.stats.damage,
-                W_GUN => s.stats.damage * s.ammo.min(4.0),
-                _ => 0.0,
-            }).sum::<f32>() * f.dmg_scale;
+            let burst = self.burst_vs(f, tg.weapons);
             let kill_shot = tune.kill_shot_range > 0.0 && tg.los && tg.dist <= tune.kill_shot_range && (tg.hp <= burst || tg.hp_frac < tune.finish_hp * 0.6);
             // In the practice run every other mech is one squad that hunts us: one that
             // walks up to us or lines us up is coming to shoot. Shoot first.
             let closing = dot2([tr.vel_s[0], tr.vel_s[1]], norm2([f.xy[0] - tg.pos[0], f.xy[1] - tg.pos[1]]));
             let to_us = (f.pos[1] - tg.pos[1]).atan2(f.pos[0] - tg.pos[0]);
             let lined_up = tr.in_obs && ang_diff(tr.aim[0], to_us).abs() < 0.12;
+            // Further out only on clearer evidence: it has walked straight at us for a
+            // while, or it comes with its guns on us. Both sides walk equally fast, so
+            // this is the longest range the fight will have, and a mech walking down the
+            // line needs no lead - the 60 m between our maximum range and the old
+            // first-strike distance were given away.
+            let far = tune.first_strike_far.min(self.cfg.vision.range + obs.me.stats.vision_bonus - 5.0);
+            let coming = tr.closing_since >= 0.0 && t - tr.closing_since >= tune.first_strike_far_s;
             let first_strike = !tune.ffa
                 && tune.first_strike_range > 0.0
                 && tg.los
-                && tg.dist <= tune.first_strike_range
                 && f.hp_frac >= tune.first_strike_hp
-                && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5);
+                && ((tg.dist <= tune.first_strike_range && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5))
+                    || (tg.dist <= far && (coming || (lined_up && closing > 4.0))));
             // No laser yet, and one lies within reach: fetch it before picking fights.
             let fetch_first = !f.has(W_LASER)
                 && ((tune.unarmed_strike_range > 0.0 && tg.dist > tune.unarmed_strike_range && self.wanted_laser(f, obs, &sit).is_some())
@@ -1148,7 +1260,33 @@ impl Bot {
         self.mover.drive(nav, &obs.me, goal, arrive_r, f.t, &f.jet, climb, f.can_plan())
     }
 
+    /// Walk to a thing that is picked up by standing next to it (a weapon, a cube).
+    /// Close by, with a clear straight walk, the legs head for the thing itself (or a
+    /// spot just short of it) instead of the nav node nearest to it: a node's centre can
+    /// be further from the thing than the pickup radius, and the bot then stood at the
+    /// end of its path with the thing just out of reach.
+    pub(crate) fn drive_to_item(&mut self, f: &Frame, obs: &Obs, goal: V3, arrive_r: f32, climb: bool) -> Drive {
+        self.leg_goal = Some(goal);
+        let d = dist2d(goal, f.pos);
+        if d < 9.0 && (goal[2] - f.pos[2]).abs() < 3.0 && obs.me.grounded && !self.mover.hopping() {
+            let dir = norm2([goal[0] - f.xy[0], goal[1] - f.xy[1]]);
+            for short in [0.0f32, 2.5] {
+                let left = d - short;
+                if left <= 0.05 {
+                    return Drive { arrived: true, remaining: 0.0, ..Default::default() };
+                }
+                let to = [f.xy[0] + dir[0] * left, f.xy[1] + dir[1] * left];
+                if self.world.walk_clear(f.pos, to, &f.slim, 3.0).is_some() {
+                    self.mover.clear_path();
+                    return Drive { dir, arrived: left < arrive_r, remaining: left, ..Default::default() };
+                }
+            }
+        }
+        self.drive_to(f, obs, goal, arrive_r, climb)
+    }
+
     fn plan_move(&mut self, f: &Frame, obs: &Obs, sit: &Sit) -> Intent {
+        self.leg_goal = None;
         let me = &obs.me;
         let z = f.zone;
         let home = self.home.unwrap_or(f.pos);
@@ -1156,12 +1294,25 @@ impl Bot {
         let under_fire = sit.n_engaged > 0 || self.model.dmg_recent > 40.0;
 
         // 1. Endgame: the circle closes to nothing and every metre from its centre costs
-        //    seconds of zone damage. Get to the centre and stay there.
+        //    seconds of zone damage. Get to the best free spot and stay there.
         if z.nr <= 1.0 || z.r <= 30.0 {
-            let centre = self.navs[f.nav_idx].1.nearest_walkable(z.nc[0], z.nc[1]).unwrap_or(home);
-            let d = self.drive_to(f, obs, centre, 0.6, false);
+            if self.tune.final_seat <= 0.0 {
+                let centre = self.navs[f.nav_idx].1.nearest_walkable(z.nc[0], z.nc[1]).unwrap_or(home);
+                let d = self.drive_to(f, obs, centre, 0.6, false);
+                let mut it = Intent::new(Mode::Final, d, 3.0);
+                it.boost = d.remaining > 12.0 && (!me.in_zone || z.leaves_at(f.xy, 3.0).map_or(false, |t| t - f.t < 4.0));
+                it.no_charge = d.remaining > 6.0;
+                return it;
+            }
+            let (seat, roof) = self.final_seat(f, obs, sit).unwrap_or((home, false));
+            // Outside the circle nothing else counts: straight in, towards its centre.
+            let (goal, climb) = if me.in_zone { (seat, roof) } else { (self.navs[f.nav_idx].1.nearest_walkable(z.c[0], z.c[1]).unwrap_or(seat), false) };
+            let d = self.drive_to(f, obs, goal, 0.6, climb);
             let mut it = Intent::new(Mode::Final, d, 3.0);
-            it.boost = d.remaining > 12.0 && (!me.in_zone || z.leaves_at(f.xy, 3.0).map_or(false, |t| t - f.t < 4.0));
+            // The good spots go to whoever is there first (bodies are pushed apart): run.
+            // Energy has no better use now - except the hop onto a roof, and lightning.
+            let keep = if f.has(W_LIGHTNING) { 40.0 } else { 3.0 };
+            it.boost = !d.waiting && if !me.in_zone { d.remaining > 2.0 } else { d.remaining > 3.0 && !climb && me.energy > keep };
             it.no_charge = d.remaining > 6.0;
             return it;
         }
@@ -1211,11 +1362,11 @@ impl Bot {
         //     get out of their sight and let whoever hunts us come round the corner alone.
         if sit.wary && need == 0 {
             if let Some((g, climb)) = self.laser_run(f, obs, sit) {
-                let d = self.drive_to(f, obs, g, 0.4, climb);
+                let d = self.drive_to_item(f, obs, g, 0.4, climb);
                 return Intent::new(Mode::Loot, d, 2.0);
             }
             if let Some(g) = self.quick_grab(f, obs, sit, 70.0, 55.0) {
-                let d = self.drive_to(f, obs, g, 0.4, false);
+                let d = self.drive_to_item(f, obs, g, 0.4, false);
                 return Intent::new(Mode::Loot, d, 2.0);
             }
             let near = sit.foes.iter().filter(|x| x.age < 10.0).min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)).copied();
@@ -1291,6 +1442,98 @@ impl Bot {
             it.strafe = strafe_axis.map(|a| (a, 0.8));
         }
         it
+    }
+
+    /// The standing spot for the last circle: (place, whether it is on a roof).
+    ///
+    /// What decides the order of death there is how long each mech stands outside the
+    /// circle at its 260 HP/s, and that is very one-sided: the circle closes on the final
+    /// point from where its centre is now, so a spot on that side stays inside seconds
+    /// longer per metre than one on the far side. Bodies are pushed apart, so the point
+    /// itself goes to one mech. Hence: among the places to stand near the final point
+    /// that no mech nearer to them occupies, take the one the circle passes last (and
+    /// that we can reach before it does). When the final point lies inside a building,
+    /// its roof is such a place if we have the jet energy for the hop.
+    fn final_seat(&mut self, f: &Frame, obs: &Obs, sit: &Sit) -> Option<(V3, bool)> {
+        let t = f.t;
+        if let Some((p, roof, at)) = self.seat {
+            if t >= at && t - at < 0.5 {
+                return Some((p, roof));
+            }
+        }
+        let z = f.zone;
+        let me = &obs.me;
+        let nav = &self.navs[f.nav_idx].1;
+        let speed = me.stats.walk_speed.max(1.0);
+        let end = z.t1.max(t);
+        let cur = nav.nearest_node(f.pos);
+        let here = cur.map(|n| nav.comp_of(n));
+        let reach = 0.8 * max_climb(me.max_energy, &f.jet);
+        let spacing = f.body.radius + self.cfg.mech.radius + 0.5;
+        let mut best: Option<(f32, V3, bool)> = None;
+        for r in [self.tune.final_seat_r.max(4.0), 45.0] {
+            let (ci, cj) = nav.cell_of(z.nc[0], z.nc[1]);
+            let k = (r / nav.cell.max(0.5)).ceil() as i32;
+            for i in ci - k..=ci + k {
+                for j in cj - k..=cj + k {
+                    for n in nav.cell_nodes(i, j) {
+                        let p = nav.node_pos(n);
+                        let dc = (p[0] - z.nc[0]).hypot(p[1] - z.nc[1]);
+                        if dc > r {
+                            continue;
+                        }
+                        let mut travel = dist2d(p, f.pos) / speed;
+                        let mut roof = false;
+                        if Some(nav.comp_of(n)) != here {
+                            if !nav.is_main(n) {
+                                // another roof or yard: only by a hop we have the energy for now
+                                let Some(reg) = nav.region_of(n) else { continue };
+                                let a = reg
+                                    .access
+                                    .iter()
+                                    .filter(|a| a.climb < reach && a.climb <= self.tune.final_roof && !self.mover.access_bad(a) && me.energy >= crate::mover::climb_energy(a.climb, &f.jet) + 4.0)
+                                    .min_by(|a, b| (dist2d(f.pos, a.ground) + 3.0 * a.climb).partial_cmp(&(dist2d(f.pos, b.ground) + 3.0 * b.climb)).unwrap_or(std::cmp::Ordering::Equal));
+                                let Some(a) = a else { continue };
+                                if cur.map_or(true, |c| !nav.is_main(c)) {
+                                    continue; // roof to roof: not worth the two hops
+                                }
+                                travel = dist2d(f.pos, a.ground) / speed + a.climb / 6.0 + 2.5 + dist2d(a.top, p) / speed;
+                                roof = true;
+                            } else {
+                                travel += 2.0; // we stand on a roof and it is on the ground: climb down
+                            }
+                        }
+                        // When the closing circle passes it (after the end: never).
+                        let leave = z.leaves_at([p[0], p[1]], 0.0).unwrap_or(end + 1.0);
+                        if leave < t + travel + if roof { 2.0 } else { 0.3 } {
+                            continue; // the circle is there before us
+                        }
+                        // taken by a mech that is nearer to it than we are
+                        if sit.foes.iter().any(|x| x.age < 1.5 && (x.pos[2] - p[2]).abs() < 6.0 && dist2d(x.pos, p) < spacing && dist2d(x.pos, p) < dist2d(f.pos, p)) {
+                            continue;
+                        }
+                        let mut score = leave - 0.03 * dc - 0.05 * travel - if roof { 1.5 } else { 0.0 };
+                        if let Some((c, _, _)) = self.seat {
+                            if dist2d(c, p) < 1.5 && (c[2] - p[2]).abs() < 2.0 {
+                                score += 0.4;
+                            }
+                        }
+                        if best.map_or(true, |b| score > b.0) {
+                            best = Some((score, p, roof));
+                        }
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        let pick = match best {
+            Some((_, p, roof)) => (p, roof),
+            None => (nav.nearest_walkable(z.nc[0], z.nc[1])?, false),
+        };
+        self.seat = Some((pick.0, pick.1, t));
+        Some(pick)
     }
 
     /// A cube (or a wanted weapon) close enough to grab without walking into anyone:
@@ -1454,7 +1697,7 @@ impl Bot {
 
     /// Something worth walking to while we fight `tg`: the laser we lack, a cube, a
     /// weapon for an empty slot - if the way there does not lead towards any enemy.
-    fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<V3> {
+    fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<(V3, bool)> {
         let reach = self.tune.errand_range;
         if reach <= 0.0 {
             return None;
@@ -1480,13 +1723,13 @@ impl Bot {
                 dist2d(x.pos, p) >= keep
             })
         };
-        let mut best: Option<(f32, V3)> = None;
-        let mut offer = |value: f32, p: V3, limit: f32, prize: bool| {
+        let mut best: Option<(f32, V3, bool)> = None;
+        let mut offer = |value: f32, p: V3, limit: f32, prize: bool, pile: bool| {
             let d = dist2d(p, f.pos);
             if d <= limit && ok(p, prize) {
                 let score = value / (d + 12.0);
                 if best.map_or(true, |b| score > b.0) {
-                    best = Some((score, p));
+                    best = Some((score, p, pile));
                 }
             }
         };
@@ -1497,17 +1740,22 @@ impl Bot {
             }
             let bit = weapon_bit(&p.kind);
             if bit == W_LASER && !f.has(W_LASER) {
-                offer(self.tune.w_laser, p.pos, reach, true);
+                offer(self.tune.w_laser, p.pos, reach, true, false);
             } else if empty && !f.has(bit) && bit != 0 {
-                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3, false);
+                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3, false, false);
             }
         }
         if obs.me.cubes < self.tune.max_cubes {
+            // A dead mech's pile (its cubes plus two) is worth a longer dash than one
+            // cube: each is +4% HP and damage, and the fight has to move somewhere.
+            let room = (self.tune.max_cubes - obs.me.cubes).max(1.0);
             for c in &self.model.cubes {
-                offer(self.tune.v_cube, c.pos, reach * self.tune.errand_cube_frac, false);
+                let n = self.pile_at(c.pos, room);
+                let far = 1.0 + (self.tune.errand_pile * (n - 1.0)).clamp(0.0, 1.0);
+                offer(self.tune.v_cube * self.cube_gain(obs.me.cubes, n), c.pos, reach * self.tune.errand_cube_frac * far, false, n >= 2.0);
             }
         }
-        best.map(|b| b.1)
+        best.map(|b| (b.1, b.2))
     }
 
     fn plan_fight(&mut self, f: &Frame, obs: &Obs, sit: &Sit, tg: Foe) -> Intent {
@@ -1524,18 +1772,18 @@ impl Bot {
         let hurry = self.tune.errand_boost > 0.0 && tg.los && tg.dist < self.tune.errand_boost && me.energy > 12.0;
         if let Some((g, climb)) = self.laser_run(f, obs, sit) {
             self.fight_kind = 1;
-            let d = self.drive_to(f, obs, g, 0.4, climb);
+            let d = self.drive_to_item(f, obs, g, 0.4, climb);
             let mut it = Intent::new(Mode::Fight, d, 1.9);
             it.strafe = Some((side, 0.45 * sw));
             it.boost = hurry && d.remaining > 8.0;
             return it;
         }
-        if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
+        if let Some((g, pile)) = self.fight_errand(f, obs, sit, &tg, rmin) {
             self.fight_kind = 2;
-            let d = self.drive_to(f, obs, g, 0.4, false);
+            let d = self.drive_to_item(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
-            it.boost = hurry && d.remaining > 8.0;
+            it.boost = (hurry || (pile && me.energy > 40.0)) && d.remaining > 8.0;
             return it;
         }
 
@@ -1745,6 +1993,7 @@ impl Bot {
         let me = &obs.me;
         let t = f.t;
         let d = intent.drive;
+        self.steer_dbg = (0, 0, d.hard, d.dir);
         if d.hard {
             // hop or recovery: exact control
             let _ = self.mover.unstick(me, [0.0, 0.0], true, t, f.dt, self.tune.stuck_time_s, &mut self.rng);
@@ -1793,8 +2042,15 @@ impl Bot {
         // us from walking in. (Sixteen mechs converging on a small circle with a few
         // lightning carriers inside it had the bot stand still at the rim, every step
         // inwards costing more than standing, until the zone killed it.)
+        // "About to pass" counts the walk still ahead of us: with 60 m of path left, six
+        // seconds before the rim arrives is too late. (In a crowded free-for-all the bot
+        // side-stepped in front of a neutral lightning carrier for 30 s, 60 m from
+        // safety, started walking at the six-second mark and died outside the circle.)
+        let zone_walk = matches!(intent.mode, Mode::Zone) && !d.arrived;
+        let walk_s = d.remaining / me.stats.walk_speed.max(1.0);
+        let force = self.tune.zone_force_s;
         let zone_urgent = matches!(intent.mode, Mode::Final)
-            || (matches!(intent.mode, Mode::Zone) && (!me.in_zone || f.zone.leaves_at(f.xy, 5.0).map_or(false, |tl| tl - t < self.tune.zone_force_s)));
+            || (matches!(intent.mode, Mode::Zone) && (!me.in_zone || (force >= 0.0 && f.zone.leaves_at(f.xy, 5.0).map_or(false, |tl| tl - t < force + 1.2 * walk_s))));
         if zone_urgent {
             arcs.clear();
         }
@@ -1807,6 +2063,7 @@ impl Bot {
             }
         }
         let under_fire = sit.n_engaged > 0 || self.model.dmg_recent > 40.0;
+        self.steer_dbg = (arcs.len(), others.len(), false, d.dir);
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
         let mut cmd = d.dir;
         if !plain && me.grounded {
@@ -1836,6 +2093,9 @@ impl Bot {
                     // so rather step out of our own line of fire than hold it standing)
                     s -= if zone_urgent && !d.arrived {
                         6.0
+                    } else if zone_walk {
+                        // on the way into the circle: go round an arc, do not wait in front of it
+                        1.5
                     } else if under_fire && intent.strafe.is_some() {
                         self.tune.stand_penalty
                     } else if intent.strafe.is_some() || intent.away.is_some() {
@@ -1883,7 +2143,8 @@ impl Bot {
                     // distance to the carrier one second from now if we walk this way
                     let q = [f.xy[0] + c[0] * speed, f.xy[1] + c[1] * speed];
                     let d = (q[0] - p[0]).hypot(q[1] - p[1]);
-                    let safe = arc_r + 15.0;
+                    // (walking into the circle only the arc itself is kept clear of)
+                    let safe = arc_r + if zone_walk { 4.0 } else { 15.0 };
                     if d < safe {
                         s -= self.tune.arc_avoid * (safe - d) / 15.0;
                     }
@@ -1959,7 +2220,7 @@ impl Bot {
         let offer = obs.offer.as_ref()?;
         let mut best = (f32::NEG_INFINITY, 0u32);
         for (i, c) in offer.choices.iter().enumerate() {
-            let mut w = crate::config::upgrade_weight(&c.id);
+            let mut w = crate::config::upgrade_weight_for(&c.id, self.tune.ffa);
             if c.id.starts_with("laser_") && c.id != "laser_pierce" {
                 w += self.tune.up_laser;
             } else if c.id.starts_with("gun_") {

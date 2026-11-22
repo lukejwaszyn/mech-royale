@@ -53,6 +53,8 @@ pub struct Track {
     /// Seconds it spent shooting at us with a clear line / we spent shooting at it.
     pub their_time: f32,
     pub our_time: f32,
+    /// Since when it has been coming straight at us without a break (negative = it is not).
+    pub closing_since: f32,
 }
 
 impl Track {
@@ -135,6 +137,8 @@ pub struct Model {
     pub kills: u32,
     /// Pickup ids whose `take` failed for good.
     pub bad_pickups: Vec<i64>,
+    /// Cubes we stood next to and could not collect: not believed while listed here.
+    pub bad_cubes: Vec<i64>,
     pub last_took_t: f32,
     last_alive: i32,
     /// Last time the count of living mechs went down.
@@ -351,6 +355,7 @@ impl Model {
                     dmg_them_total: 0.0,
                     their_time: 0.0,
                     our_time: 0.0,
+                    closing_since: -1.0,
                     })
                 }
             }
@@ -437,7 +442,7 @@ impl Model {
                     x.pos = c.pos;
                     x.seen_t = t;
                 }
-                None if believe(c.id, c.pos, ghosts) => self.cubes.push(Cube { id: c.id, pos: c.pos, seen_t: t, missing: 0.0 }),
+                None if believe(c.id, c.pos, ghosts) && !self.bad_cubes.contains(&c.id) => self.cubes.push(Cube { id: c.id, pos: c.pos, seen_t: t, missing: 0.0 }),
                 None => {}
             }
         }

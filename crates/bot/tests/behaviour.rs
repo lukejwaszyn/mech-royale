@@ -367,6 +367,180 @@ fn walks_into_the_zone_past_a_lightning_carrier() {
     };
     let mut never = Tuning::default();
     never.zone_force_s = -1.0;
-    assert!(east(never) < 0.5, "without the rule the arc holds the bot back (the test bites)");
-    assert!(east(Tuning::default()) > 0.5, "walking east into the circle");
+    assert!(east(never) < 0.95, "without the rule the arc bends the walk (the test bites)");
+    assert!(east(Tuning::default()) > 0.97, "walking straight east into the circle");
+}
+
+/// A weapon we cannot stand next to is not a task: one lying 6 m overhead (a ledge with
+/// no room to stand, its nearest nav node the ground below) is out of `take`'s 4 m of
+/// height. The bot used to walk under it and stand there, 40 s at a time, in every fight.
+#[test]
+fn ignores_a_weapon_it_cannot_stand_next_to() {
+    let walk = |z: f32| -> (bool, f64) {
+        let mut s = session(Tuning::default());
+        let laser = json!([{"id": 8001, "kind": "laser", "pos": [HERE[0] + 60.0, HERE[1], z]}]);
+        let mut a = Value::Null;
+        for k in 0..6 {
+            a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+        }
+        (s.bot.as_ref().unwrap().mode == bot::brain::Mode::Loot, a["move"][0].as_f64().unwrap())
+    };
+    let (loot, mx) = walk(0.0);
+    assert!(loot && mx > 0.8, "a laser on the ground is fetched (loot={loot}, move x={mx})");
+    let (loot, _) = walk(6.5);
+    assert!(!loot, "a laser 6.5 m overhead is not");
+}
+
+/// Standing next to the thing we came for without getting it: after a few seconds it is
+/// given up (nothing may hold the bot on one spot), tried once more a minute later, and
+/// then left for good.
+#[test]
+fn gives_up_a_pickup_it_stands_next_to_and_cannot_take() {
+    let mut s = session(Tuning::default());
+    // as if a wall held us 5 m short of it: the observations never show us any closer
+    let laser = json!([{"id": 8001, "kind": "laser", "pos": [HERE[0] + 5.0, HERE[1], 0.0]}]);
+    let bad = |s: &Session| s.bot.as_ref().unwrap().model.bad_pickups.contains(&8001);
+    let mut k = 0;
+    let mut gave_up_at = None;
+    while k < 100 && gave_up_at.is_none() {
+        let a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+        assert!(a.get("take").is_none(), "out of reach: {a}");
+        if k < 5 {
+            assert!(a["move"][0].as_f64().unwrap() > 0.2, "walks at it: {a}");
+        }
+        if bad(&s) {
+            gave_up_at = Some(k);
+        }
+        k += 1;
+    }
+    let at = gave_up_at.expect("given up within ten seconds");
+    assert!((30..=60).contains(&at), "after about four seconds (decision {at})");
+    let a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(s.bot.as_ref().unwrap().mode != bot::brain::Mode::Loot, "and not walked at any more: {a}");
+    // a minute later it gets a second chance ...
+    let later = k + 620;
+    step(&mut s, &obs(later, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(!bad(&s), "second chance after a minute");
+    // ... and when that fails too it is left for good
+    for j in 1..80 {
+        step(&mut s, &obs(later + j, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    }
+    assert!(bad(&s));
+    step(&mut s, &obs(later + 1500, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(bad(&s), "no third chance");
+}
+
+/// The same for a cube: it is forgotten and not believed again while given up.
+#[test]
+fn gives_up_a_cube_it_cannot_collect() {
+    let mut s = session(Tuning::default());
+    let cube = json!([{"id": 5009, "pos": [HERE[0] + 6.0, HERE[1], 0.0]}]);
+    for k in 0..60 {
+        step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"cubes": cube})));
+    }
+    let bot = s.bot.as_ref().unwrap();
+    assert!(bot.model.cubes.is_empty() && bot.model.bad_cubes.contains(&5009), "the cube is given up");
+    let a = step(&mut s, &obs(60, HERE, [0.0, 0.0], json!([gun(), null]), json!({"cubes": cube})));
+    assert!(s.bot.as_ref().unwrap().model.cubes.is_empty(), "and stays forgotten: {a}");
+}
+
+/// Last circle: the spot is chosen by when the closing circle passes it, not by its
+/// distance from the final point. With the final point itself taken by another mech,
+/// the bot goes for the free spot on the side the circle closes from (which stays
+/// inside longest), not for the nearest one on the far side - and it runs there.
+#[test]
+fn last_circle_takes_the_spot_the_zone_passes_last() {
+    let c5 = [HERE[0], HERE[1]];
+    let cf = [HERE[0] + 15.0, HERE[1]];
+    let zone = json!({"center": c5, "radius": 25.0, "next_center": cf, "next_radius": 0.0, "shrink_start": 390.0, "shrink_end": 415.0, "dps": 260.0});
+    let squatter = mech(7, [cf[0], cf[1], 0.0], [0.0, 0.0, 0.0], [0.0, 0.0], json!(["gun"]));
+    let run = |from: [f32; 3], tune: Tuning| -> Value {
+        let mut s = session(tune);
+        let mut a = Value::Null;
+        for k in 3760..3766 {
+            a = step(&mut s, &obs(k, from, [0.0, 0.0], json!([gun(), null]), json!({"zone": zone, "mechs": [squatter], "alive": 6})));
+        }
+        assert_eq!(s.bot.as_ref().unwrap().mode, bot::brain::Mode::Final);
+        a
+    };
+    // From the far side (east of the final point): the old rule stops at the nearest
+    // free ground, on the far side; the new one walks round to the near side.
+    let east = [cf[0] + 9.0, cf[1] + 3.0, 0.0];
+    let a = run(east, Tuning::default());
+    assert!(a["move"][0].as_f64().unwrap() < -0.3, "heads past the final point to the side the circle comes from: {a}");
+    assert_eq!(a["boost"], json!(true), "and runs: {a}");
+    // From the near side it stops short of the squatter, between the two centres.
+    let west = [cf[0] - 5.5, cf[1], 0.0];
+    let a = run(west, Tuning::default());
+    let (mx, my) = (a["move"][0].as_f64().unwrap(), a["move"][1].as_f64().unwrap());
+    assert!(mx.hypot(my) < 0.9 || mx < 0.5, "already on a good spot, no walking into the squatter: {a}");
+    // Outside the circle: straight towards its current centre, on boost.
+    let out = [c5[0] - 30.0, c5[1], 0.0];
+    let mut s = session(Tuning::default());
+    let mut a = Value::Null;
+    for k in 3760..3764 {
+        let mut o: Value = serde_json::from_str(&obs(k, out, [0.0, 0.0], json!([gun(), null]), json!({"zone": zone, "alive": 6}))).unwrap();
+        o["self"]["in_zone"] = json!(false);
+        a = step(&mut s, &o.to_string());
+    }
+    assert!(a["move"][0].as_f64().unwrap() > 0.9 && a["boost"] == json!(true), "outside: straight in, running: {a}");
+}
+
+/// Far first strike: a mech 175 m away that keeps coming straight at us is fired on
+/// after a moment (first contact is the longest range the fight will have); one that
+/// walks past at that distance is left alone, and so is everybody in free-for-all.
+#[test]
+fn far_first_strike_needs_a_mech_that_keeps_coming() {
+    let foe = [HERE[0] + 175.0, HERE[1], 0.0];
+    let run = |tune: Tuning, vel: [f32; 3], aim: f32| -> Option<u32> {
+        let mut s = session(tune);
+        for k in 0..40 {
+            let a = step(&mut s, &obs(k, HERE, [0.0, -0.02], json!([gun(), laser()]), json!({"mechs": [mech(7, foe, vel, [aim, 0.0], json!(["gun"]))]})));
+            if a["fire"][0] == json!(true) || a["fire"][1] == json!(true) {
+                return Some(k);
+            }
+        }
+        None
+    };
+    // coming, its guns elsewhere: only after it has kept coming for a while
+    let first = run(Tuning::default(), [-11.0, 0.0, 0.0], 1.2).expect("opens fire on the mech that keeps coming");
+    assert!((13..=30).contains(&first), "after about 1.5 s of coming straight at us (decision {first})");
+    // coming with its guns on us: at once
+    assert!(run(Tuning::default(), [-11.0, 0.0, 0.0], 3.14).expect("opens fire") <= 6);
+    assert_eq!(run(Tuning::default(), [0.0, 11.0, 0.0], 1.57), None, "a mech walking past is left alone");
+    assert_eq!(run(Tuning::default(), [0.0, 0.0, 0.0], 3.14), None, "and so is one that merely looks our way");
+    let mut off = Tuning::default();
+    off.first_strike_far = 0.0;
+    assert_eq!(run(off, [-11.0, 0.0, 0.0], 3.14), None, "switched off: nothing beyond the old range");
+    let mut ffa = Tuning::default();
+    ffa.apply_ffa();
+    assert_eq!(run(ffa, [-11.0, 0.0, 0.0], 3.14), None, "free-for-all: never");
+}
+
+/// The same with the circle still a dozen seconds away but 70 m of walking ahead: the
+/// walk has to start now, arc or no arc. (The six-second rule alone let the bot wait in
+/// front of a neutral lightning carrier until it was too late to walk in.)
+#[test]
+fn starts_the_walk_into_the_zone_in_time_past_a_lightning_carrier() {
+    let east = |tune: Tuning| -> f64 {
+        let mut s = session(tune);
+        // the rim reaches us at t = 27.7 s; it is t = 15 s and safety is 70 m to the east
+        let zone = json!({"center": [100.0, 0.0], "radius": 135.0, "next_center": [100.0, 0.0], "next_radius": 70.0, "shrink_start": 0.0, "shrink_end": 120.0, "dps": 100.0});
+        let pos = [-20.0, 0.0, 0.0];
+        let foe = json!([mech(7, [25.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.5, 0.0], json!(["gun", "lightning"]))]);
+        let mut a = json!(null);
+        for k in 150..154 {
+            let mut o: Value = serde_json::from_str(&obs(k, pos, [0.0, 0.0], json!([gun(), laser()]), json!({"mechs": foe}))).unwrap();
+            let r = 135.0 - 65.0 * (k as f64 * 0.1) / 120.0;
+            o["zone"] = zone.clone();
+            o["zone"]["radius"] = json!(r);
+            a = step(&mut s, &o.to_string());
+        }
+        assert_eq!(format!("{:?}", s.bot.as_ref().unwrap().mode), "Zone");
+        a["move"][0].as_f64().unwrap()
+    };
+    let mut never = Tuning::default();
+    never.zone_force_s = -1.0;
+    assert!(east(never) < 0.95, "without the rule the arc bends the walk (the test bites)");
+    assert!(east(Tuning::default()) > 0.97, "walking straight east into the circle while there is time for the walk");
 }

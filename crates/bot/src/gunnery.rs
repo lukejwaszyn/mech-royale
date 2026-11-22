@@ -26,6 +26,8 @@ pub struct Tgt {
     pub live: bool,
     /// Last time we had a clear line of fire to it.
     pub fire_los_t: f32,
+    /// Its torso yaw (for the rear-armor rule).
+    pub aim_yaw: f32,
 }
 
 /// Is the actual aim close enough to `want`, allowing for the slew that happens before
@@ -93,7 +95,7 @@ impl Bot {
             let s = 1.0 + c.cubes.size_per_cube * tr.cubes;
             (c.mech.height * s, c.mech.radius * s)
         };
-        Tgt { id: tr.id, feet: tr.pos, vel: tr.vel, vel_s: tr.vel_s, height, radius, hp: tr.hp, mech: !tr.npc, weapons: tr.weapons, los: tr.los, live: tr.in_obs, fire_los_t: tr.fire_los_t }
+        Tgt { id: tr.id, feet: tr.pos, vel: tr.vel, vel_s: tr.vel_s, height, radius, hp: tr.hp, mech: !tr.npc, weapons: tr.weapons, los: tr.los, live: tr.in_obs, fire_los_t: tr.fire_los_t, aim_yaw: tr.aim[0] }
     }
 
     /// Returns (aim, fire, reload).
@@ -152,7 +154,7 @@ impl Bot {
             if !facing {
                 self.blind_face.1 = t;
             }
-            let finishing = tgt.map_or(false, |x| x.mech && x.los && x.live && x.hp <= self.burst_now(f));
+            let finishing = tgt.map_or(false, |x| x.mech && x.los && x.live && x.hp <= self.burst_vs(f, x.weapons));
             if dmg >= tune.blind_turn_dmg && tune.blind_turn_dmg > 0.0 && t >= self.blind_face.2 && !finishing {
                 face_blind = Some(bearing);
                 tgt = None;
@@ -185,7 +187,7 @@ impl Bot {
                     if let Some(c) = self.model.crates.iter().find(|c| c.id == id) {
                         let cc = &self.cfg.crates;
                         let mid = [c.pos[0], c.pos[1], c.pos[2] + cc.height * 0.5];
-                        tgt = Some(Tgt { id, feet: c.pos, vel: [0.0; 3], vel_s: [0.0; 3], height: cc.height, radius: cc.radius, hp: c.hp, mech: false, weapons: 0, los: world.los(f.muzzle, mid), live: true, fire_los_t: t });
+                        tgt = Some(Tgt { id, feet: c.pos, vel: [0.0; 3], vel_s: [0.0; 3], height: cc.height, radius: cc.radius, hp: c.hp, mech: false, weapons: 0, los: world.los(f.muzzle, mid), live: true, fire_los_t: t, aim_yaw: 0.0 });
                     }
                 }
                 None => {}
@@ -242,7 +244,21 @@ impl Bot {
                 let peeking = tg.mech && tg.live && d < 150.0 && !intent.hold_fire && t - tg.fire_los_t <= tune.precharge_s;
                 let start = ready && in_range && !intent.no_charge && (clear || peeking);
                 if charging || start {
-                    let dmg_now = laser_damage(s.stats.damage, s.stats.min_frac, full, s.charge) * f.dmg_scale;
+                    // What the beam does to this target: +60% to a mech that carries a
+                    // mortar (cook-off), x1.5 into its back (only when we are well
+                    // outside its front arc: it may be turning to us).
+                    let mut mult = 1.0;
+                    if tg.mech {
+                        if tg.weapons & W_MORTAR != 0 {
+                            mult *= 1.0 + self.cookoff(s);
+                        }
+                        let to_us = (f.pos[1] - tg.feet[1]).atan2(f.pos[0] - tg.feet[0]);
+                        let half_arc = self.cfg.mech.front_arc_deg.to_radians() * 0.5;
+                        if tg.live && ang_diff(tg.aim_yaw, to_us).abs() > half_arc + 0.4 {
+                            mult *= self.cfg.mech.rear_mult.max(1.0);
+                        }
+                    }
+                    let dmg_now = laser_damage(s.stats.damage, s.stats.min_frac, full, s.charge) * f.dmg_scale * mult;
                     let kill_now = charging && clear && on && s.charge >= s.stats.min_charge && dmg_now >= tg.hp;
                     let charged = s.charge >= full - 0.03;
                     let release = kill_now || (charged && clear && on);
@@ -305,13 +321,19 @@ impl Bot {
         (aim, fire, reload)
     }
 
-    /// Damage we can put out in the next second or so with what is loaded.
-    pub(crate) fn burst_now(&self, f: &Frame) -> f32 {
+    /// The laser's cook-off bonus (from the weapon's own stats, else from the rules).
+    fn cookoff(&self, s: &Slot) -> f32 {
+        if s.stats.cookoff > 0.0 { s.stats.cookoff } else { self.cfg.weapons.get("laser").cookoff.max(0.0) }
+    }
+
+    /// Damage we can put out in the next second or so with what is loaded, against a
+    /// mech holding `weapons` (the laser sets off a carried mortar: +`cookoff`).
+    pub(crate) fn burst_vs(&self, f: &Frame, weapons: u8) -> f32 {
         f.slots
             .iter()
             .flatten()
             .map(|s| match s.bit {
-                W_LASER if s.cooldown < 1.0 => s.stats.damage,
+                W_LASER if s.cooldown < 1.0 => s.stats.damage * if weapons & W_MORTAR != 0 { 1.0 + self.cookoff(s) } else { 1.0 },
                 W_GUN => s.stats.damage * s.ammo.min(4.0),
                 _ => 0.0,
             })
