@@ -25,6 +25,6 @@ COPY --from=build /bot /bot
 # Runs in the empty image: proves the binary is static and starts.
 RUN ["/bot", "--version"]
 # practice | ffa  (ffa = the final: free-for-all against other teams' bots)
-ENV MECH_MODE=practice
+ENV MECH_MODE=ffa
 USER 65534:65534
 ENTRYPOINT ["/bot"]
