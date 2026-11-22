@@ -59,10 +59,18 @@ pub struct Mover {
     failed_hops: Vec<(V3, u32)>,
     /// Hops that ended without arriving (diagnostics).
     pub hop_failures: u32,
+    /// Hops out of a region (off a roof, out of a yard or the stadium bowl) that failed
+    /// in a row, and until when we stop hopping and simply walk at the goal, so that
+    /// stuck recovery (jump, sidestep, jump and jet) gets a turn.
+    exit_fails: u32,
+    exit_pause_until: f32,
 }
 
 /// Failed hops after which an access is given up.
 const HOP_TRIES: u32 = 2;
+/// Failed exits in a row after which hopping pauses for `EXIT_PAUSE_S`.
+const EXIT_TRIES: u32 = 3;
+const EXIT_PAUSE_S: f32 = 4.0;
 
 /// Energy to jet `climb` metres up, with a margin for hovering over the edge.
 pub fn climb_energy(climb: f32, jp: &JetParams) -> f32 {
@@ -71,7 +79,7 @@ pub fn climb_energy(climb: f32, jp: &JetParams) -> f32 {
 
 impl Mover {
     pub fn new() -> Mover {
-        Mover { path_t: -1e9, last_stuck_t: -1e9, ..Default::default() }
+        Mover { path_t: -1e9, last_stuck_t: -1e9, exit_pause_until: -1e9, ..Default::default() }
     }
 
     pub fn hopping(&self) -> bool {
@@ -91,15 +99,25 @@ impl Mover {
     pub fn access_bad(&self, a: &Access) -> bool {
         self.failed_hops.iter().any(|(g, n)| *n >= HOP_TRIES && dist2d(*g, a.ground) < 1.0 && (g[2] - a.ground[2]).abs() < 2.0)
     }
-    fn note_hop_end(&mut self, h: &Hop, me: &SelfObs) {
+    fn note_hop_end(&mut self, h: &Hop, me: &SelfObs, t: f32) {
         // Arrived = standing near the far end, at its height.
         let ok = dist2d(me.pos, h.to) < h.span.max(3.0) * 0.8 + 2.5 && (me.pos[2] - h.to[2]).abs() < 2.5 && (!h.up || me.pos[2] > h.from[2] + 0.5 * (h.to[2] - h.from[2]));
         if ok {
+            if !h.up {
+                self.exit_fails = 0;
+            }
             return;
         }
         self.hop_failures += 1;
+        if !h.up {
+            self.exit_fails += 1;
+            if self.exit_fails >= EXIT_TRIES {
+                self.exit_fails = 0;
+                self.exit_pause_until = t + EXIT_PAUSE_S;
+            }
+        }
         if std::env::var("MECH_VERBOSE").is_ok() {
-            eprintln!("[hop-fail] up={} from=({:.1},{:.1},{:.1}) to=({:.1},{:.1},{:.1}) crest={:.1} ended at=({:.1},{:.1},{:.1}) grounded={} e={:.0} left_ground={} need_jump={}", h.up, h.from[0], h.from[1], h.from[2], h.to[0], h.to[1], h.to[2], h.crest, me.pos[0], me.pos[1], me.pos[2], me.grounded, me.energy, h.left_ground, h.need_jump);
+            crate::vlogln!("[hop-fail] up={} from=({:.1},{:.1},{:.1}) to=({:.1},{:.1},{:.1}) crest={:.1} ended at=({:.1},{:.1},{:.1}) grounded={} e={:.0} left_ground={} need_jump={}", h.up, h.from[0], h.from[1], h.from[2], h.to[0], h.to[1], h.to[2], h.crest, me.pos[0], me.pos[1], me.pos[2], me.grounded, me.energy, h.left_ground, h.need_jump);
         }
         let key = h.ground;
         match self.failed_hops.iter_mut().find(|(g, _)| dist2d(*g, key) < 1.0 && (g[2] - key[2]).abs() < 2.0) {
@@ -117,7 +135,7 @@ impl Mover {
             if let Some(d) = self.do_hop(me, t) {
                 return d;
             }
-            self.note_hop_end(&h, me);
+            self.note_hop_end(&h, me, t);
         }
         let straight = dist2d(pos, goal);
         let to_goal = norm2([goal[0] - pos[0], goal[1] - pos[1]]);
@@ -143,17 +161,15 @@ impl Mover {
         }
         if !nav.is_main(cur) {
             // We stand on a roof / deck / in an enclosed region and the goal is elsewhere: leave.
+            // A hop out that keeps failing (an eave stops the jet, a parapet is higher
+            // than the map says, the server holds us on the edge) is not repeated for
+            // ever: after a few failures walk straight at the goal for a moment - a
+            // plain drive, so that stuck recovery can jump and jet us over.
+            if t < self.exit_pause_until {
+                return Drive { dir: to_goal, remaining: straight.max(10.0), ..Default::default() };
+            }
             if let Some(region) = nav.region_of(cur) {
-                let best = region
-                    .access
-                    .iter()
-                    .min_by(|a, b| {
-                        let ca = dist(pos, a.top) + 0.3 * dist2d(a.ground, goal) + a.climb_out * 4.0;
-                        let cb = dist(pos, b.top) + 0.3 * dist2d(b.ground, goal) + b.climb_out * 4.0;
-                        ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .copied();
-                if let Some(a) = best {
+                if let Some(a) = self.exit_access(&region.access, pos, goal) {
                     return self.via_access(nav, me, a, false, t, jp, can_plan);
                 }
             }
@@ -185,6 +201,14 @@ impl Mover {
             return Drive { arrived: true, remaining: 0.0, ..Default::default() };
         }
         self.walk(nav, pos, near, t, can_plan)
+    }
+
+    /// The access to leave a region by: the cheapest one whose hops have not failed, or
+    /// (when all of them have) the cheapest of all.
+    fn exit_access(&self, access: &[Access], pos: V3, goal: V3) -> Option<Access> {
+        let cost = |a: &Access| dist(pos, a.top) + 0.3 * dist2d(a.ground, goal) + a.climb_out * 4.0;
+        let pick = |all: bool| access.iter().filter(|a| all || !self.access_bad(a)).min_by(|a, b| cost(a).partial_cmp(&cost(b)).unwrap_or(std::cmp::Ordering::Equal)).copied();
+        pick(false).or_else(|| pick(true))
     }
 
     /// Walk to one end of an access and hop through it. `up` = ground -> top.
@@ -342,9 +366,9 @@ mod tests {
         let mut m = Mover::new();
         let start = [11.2, 0.5, 0.0];
         let mut me = SelfObs { pos: start, ..Default::default() };
-        m.note_hop_end(&hop(&a, start), &me);
+        m.note_hop_end(&hop(&a, start), &me, 0.0);
         assert!(!m.access_bad(&a), "one failure is not proof");
-        m.note_hop_end(&hop(&a, start), &me);
+        m.note_hop_end(&hop(&a, start), &me, 0.0);
         assert!(m.access_bad(&a), "two failures ban it");
         assert_eq!(m.hop_failures, 2);
         // another access of the same roof is untouched
@@ -353,9 +377,55 @@ mod tests {
         // a hop that arrives is not counted
         let mut m = Mover::new();
         me.pos = [15.4, 0.2, 20.0];
-        m.note_hop_end(&hop(&a, start), &me);
-        m.note_hop_end(&hop(&a, start), &me);
+        m.note_hop_end(&hop(&a, start), &me, 0.0);
+        m.note_hop_end(&hop(&a, start), &me, 0.0);
         assert!(!m.access_bad(&a));
         assert_eq!(m.hop_failures, 0);
+    }
+
+    /// A flat map with one 12 m building (x 20..60, y -30..10) whose roof is a region.
+    fn roof_nav() -> Nav {
+        let map = r#"{"bounds":{"minX":-200,"maxX":200,"minY":-200,"maxY":200},"terrain":{"minX":-210,"minY":-210,"step":420,"nx":2,"ny":2},
+            "prisms":[{"kind":"building","base":-5,"top":12,"ring":[20,-30,60,-30,60,10,20,10]}]}"#;
+        let world = std::sync::Arc::new(world::World::from_bytes(map.as_bytes(), &[0u8; 8]).unwrap());
+        Nav::build(world, world::NavParams::default())
+    }
+
+    /// Leaving a roof: an access whose hops failed is not chosen again while another is
+    /// left (the bot used to pick the same exit for ever and die on the roof), and after
+    /// a few failed exits in a row the mover stops hopping for a moment and returns a
+    /// plain drive at the goal, which stuck recovery may override.
+    #[test]
+    fn leaving_a_region_skips_failed_exits_and_pauses() {
+        let nav = roof_nav();
+        let roof = nav.regions().iter().find(|r| r.is_roof).expect("the roof is a region").clone();
+        assert!(roof.access.len() >= 2, "the roof has several accesses");
+        let pos = [40.0, -10.0, 12.0];
+        let goal = [150.0, -10.0, 0.0];
+        let me = SelfObs { pos, ..Default::default() };
+        let jp = JetParams::default();
+        let mut m = Mover::new();
+        let first = m.exit_access(&roof.access, pos, goal).unwrap();
+        // two failed hops through it (we are still on the roof, far from its ground end)
+        let down = |a: &Access| Hop { to: a.ground, crest: a.crest, t0: 0.0, need_jump: false, jumped_t: -1e9, left_ground: false, span: 6.0, from: a.top, ground: a.ground, up: false };
+        m.note_hop_end(&down(&first), &me, 1.0);
+        m.note_hop_end(&down(&first), &me, 2.0);
+        assert!(m.access_bad(&first));
+        let second = m.exit_access(&roof.access, pos, goal).unwrap();
+        assert!(dist(second.ground, first.ground) > 1.0, "another exit is tried");
+        // every exit failed: still an answer (the cheapest), never None
+        for a in &roof.access {
+            m.failed_hops.push((a.ground, HOP_TRIES));
+        }
+        assert!(m.exit_access(&roof.access, pos, goal).is_some());
+        // third failure in a row: no hop for a while, a plain drive straight at the goal
+        m.note_hop_end(&down(&second), &me, 3.0);
+        let d = m.drive(&nav, &me, goal, 1.0, 3.1, &jp, false, true);
+        assert!(!d.hard && !m.hopping(), "no hop while paused");
+        assert!(d.dir[0] > 0.9 && d.remaining >= 2.4, "walks at the goal so that stuck recovery can act: {d:?}");
+        // after the pause the exits are tried again
+        let d = m.drive(&nav, &me, goal, 1.0, 3.1 + EXIT_PAUSE_S + 0.1, &jp, false, true);
+        assert!(d.dir != [0.0, 0.0] || d.hard, "moving again: {d:?}");
+        assert!(m.hopping() || dot2(d.dir, [1.0, 0.0]) < 0.999, "heading for an exit, not blindly at the goal: {d:?}");
     }
 }
