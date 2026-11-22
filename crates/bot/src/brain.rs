@@ -1538,6 +1538,9 @@ impl Bot {
             }
         }
         if obs.me.cubes < self.tune.max_cubes {
+            // A dead mech's pile (its cubes plus two) is worth a longer dash than one
+            // cube: each is +4% HP and damage, and the fight has to move somewhere.
+            let room = (self.tune.max_cubes - obs.me.cubes).max(1.0);
             for c in &self.model.cubes {
                 let n = self.pile_at(c.pos, room);
                 let far = 1.0 + (self.tune.errand_pile * (n - 1.0)).clamp(0.0, 1.0);
@@ -1673,9 +1676,6 @@ impl Bot {
             // Close in on where it is until we have a line of fire.
             let d = self.drive_to(f, obs, tg.pos, (rmin * 0.6).max(8.0), false);
             let mut it = Intent::new(Mode::Fight, d, 1.6);
-            // A dead mech's pile (its cubes plus two) is worth a longer dash than one
-            // cube: each is +4% HP and damage, and the fight has to move somewhere.
-            let room = (self.tune.max_cubes - obs.me.cubes).max(1.0);
             if tg.engaged || sit.n_engaged > 0 {
                 it.strafe = Some((side, 0.4 * sw));
             }

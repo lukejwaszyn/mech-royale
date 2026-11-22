@@ -181,6 +181,14 @@ tuning! {
     v_crate_laser = 5.0,
     v_npc = 12.0,
     v_drop = 24.0,
+    /// Cubes lying together (a dead mech's pile) count as one trip worth all of them
+    /// (0 = every cube on its own), and the cube that reaches the next upgrade threshold
+    /// counts this many cubes extra - also for drones, crates and supply drops.
+    cube_pile = 1.0,
+    cube_upgrade_bonus = 1.0,
+    /// Supply drops are looked at out to this distance (they are announced 25 s ahead
+    /// and never go away): 3 cubes, full HP and full energy.
+    drop_range = 350.0,
     /// Upgrade choice: added to the table weight of the laser damage / charge upgrades and
     /// of the gun upgrades (the table puts max HP and armor first).
     up_laser = 0.0,
@@ -198,14 +206,6 @@ tuning! {
     /// further away than this (0 = start fights as usual).
     unarmed_strike_range = 60.0,
     /// ... keeping this far from every enemy on the way to the laser (m).
-    /// Cubes lying together (a dead mech's pile) count as one trip worth all of them
-    /// (0 = every cube on its own), and the cube that reaches the next upgrade threshold
-    /// counts this many cubes extra - also for drones, crates and supply drops.
-    cube_pile = 1.0,
-    cube_upgrade_bonus = 1.0,
-    /// Supply drops are looked at out to this distance (they are announced 25 s ahead
-    /// and never go away): 3 cubes, full HP and full energy.
-    drop_range = 350.0,
     errand_clear = 40.0,
     /// Target choice: extra weight for a mech that carries a laser.
     laser_carrier_bonus = 1.0,
@@ -221,6 +221,9 @@ tuning! {
     errand_keep_frac = 0.6,
     /// ... cubes within this fraction of `errand_range`,
     errand_cube_frac = 0.25,
+    /// ... a pile of n cubes within (1 + this x (n - 1), at most x2) as far, on boost
+    /// while there is energy to spare.
+    errand_pile = 0.5,
     /// A cube is fetched (outside fights) unless a mech we are not fighting stands
     /// within this distance of it.
     cube_keep = 90.0,
@@ -241,9 +244,6 @@ tuning! {
     explore_until_cubes = 6.0,
 }
 
-    /// ... a pile of n cubes within (1 + this x (n - 1), at most x2) as far, on boost
-    /// while there is energy to spare.
-    errand_pile = 0.5,
 /// Upgrade preference (higher = pick first). Survivability first: max HP also counts in
 /// the final zone race where armor does not; then damage, then mobility.
 pub const UPGRADE_WEIGHTS: &[(&str, f32)] = &[
