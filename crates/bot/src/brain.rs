@@ -116,6 +116,9 @@ pub struct Frame {
     pub zone: Zone,
     pub jet: JetParams,
     pub started: Instant,
+    /// False when the bot is driven without a deadline (the local simulator's
+    /// in-process mode): decisions then never depend on how long they took.
+    pub clocked: bool,
 }
 
 impl Frame {
@@ -131,7 +134,7 @@ impl Frame {
     }
     /// Is there time for another expensive query (path, cover search)?
     pub fn can_plan(&self) -> bool {
-        self.spent_ms() < 12.0
+        !self.clocked || self.spent_ms() < 12.0
     }
 }
 
@@ -419,6 +422,10 @@ pub struct Bot {
     pub debug: bool,
     pub verbose: bool,
     verbose_every: i64,
+    /// Ignore the wall clock when deciding (no "is there time left to plan?" checks).
+    /// For the local simulator's in-process mode, where nothing enforces a deadline and
+    /// a busy machine must not change the match; never set by the real protocol loop.
+    pub no_clock: bool,
 }
 
 impl Bot {
@@ -533,6 +540,7 @@ impl Bot {
             verbose_every: std::env::var("MECH_VERBOSE").ok().and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 1).unwrap_or(5),
             verbose: std::env::var("MECH_VERBOSE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
             debug: std::env::var("MECH_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            no_clock: false,
         }
     }
 
@@ -586,6 +594,7 @@ impl Bot {
             zone: Zone::from_obs(&obs.zone, obs.t),
             jet: JetParams { jump_speed: st.jump_speed, jet_accel: st.jet_accel, max_rise_speed: st.max_rise_speed, gravity: st.gravity, jet_drain: st.jet_drain },
             started,
+            clocked: !self.no_clock,
         }
     }
 
