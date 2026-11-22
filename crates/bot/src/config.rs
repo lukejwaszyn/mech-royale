@@ -272,7 +272,7 @@ impl Tuning {
         }
         if let Ok(s) = std::env::var("MECH_TUNE") {
             for bad in t.apply_overrides(&s) {
-                eprintln!("[bot] MECH_TUNE: ignored '{bad}'");
+                crate::logln!("[bot] MECH_TUNE: ignored '{bad}'");
             }
         }
         t

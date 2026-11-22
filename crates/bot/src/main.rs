@@ -3,7 +3,7 @@ fn main() {
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--version" => {
-                eprintln!("bot {} (mechfight/1)", env!("CARGO_PKG_VERSION"));
+                bot::logln!("bot {} (mechfight/1)", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "--ffa" => tune.apply_ffa(),
@@ -11,7 +11,7 @@ fn main() {
             other => {
                 if let Some(s) = other.strip_prefix("--tune=") {
                     for bad in tune.apply_overrides(s) {
-                        eprintln!("[bot] --tune: ignored '{bad}'");
+                        bot::logln!("[bot] --tune: ignored '{bad}'");
                     }
                 }
             }
