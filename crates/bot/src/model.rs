@@ -53,6 +53,8 @@ pub struct Track {
     /// Seconds it spent shooting at us with a clear line / we spent shooting at it.
     pub their_time: f32,
     pub our_time: f32,
+    /// Since when it has been coming straight at us without a break (negative = it is not).
+    pub closing_since: f32,
 }
 
 impl Track {
@@ -353,6 +355,7 @@ impl Model {
                     dmg_them_total: 0.0,
                     their_time: 0.0,
                     our_time: 0.0,
+                    closing_since: -1.0,
                     })
                 }
             }

@@ -932,6 +932,15 @@ impl Bot {
         // duel clocks: time it spent shooting at us, time we spent shooting at it
         for foe in &sit.foes {
             let tr = &mut self.model.tracks[foe.ti];
+            // coming straight at us (most of its walking speed along the line to us)
+            let closing = dot2([tr.vel_s[0], tr.vel_s[1]], norm2([f.xy[0] - tr.pos[0], f.xy[1] - tr.pos[1]]));
+            if tr.in_obs && closing > 0.75 * self.cfg.mech.walk_speed {
+                if tr.closing_since < 0.0 {
+                    tr.closing_since = t;
+                }
+            } else {
+                tr.closing_since = -1.0;
+            }
             if foe.engaged && foe.los {
                 tr.their_time += f.dt;
             }
@@ -1038,12 +1047,19 @@ impl Bot {
             let closing = dot2([tr.vel_s[0], tr.vel_s[1]], norm2([f.xy[0] - tg.pos[0], f.xy[1] - tg.pos[1]]));
             let to_us = (f.pos[1] - tg.pos[1]).atan2(f.pos[0] - tg.pos[0]);
             let lined_up = tr.in_obs && ang_diff(tr.aim[0], to_us).abs() < 0.12;
+            // Further out only on clearer evidence: it has walked straight at us for a
+            // while, or it comes with its guns on us. Both sides walk equally fast, so
+            // this is the longest range the fight will have, and a mech walking down the
+            // line needs no lead - the 60 m between our maximum range and the old
+            // first-strike distance were given away.
+            let far = tune.first_strike_far.min(self.cfg.vision.range + obs.me.stats.vision_bonus - 5.0);
+            let coming = tr.closing_since >= 0.0 && t - tr.closing_since >= tune.first_strike_far_s;
             let first_strike = !tune.ffa
                 && tune.first_strike_range > 0.0
                 && tg.los
-                && tg.dist <= tune.first_strike_range
                 && f.hp_frac >= tune.first_strike_hp
-                && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5);
+                && ((tg.dist <= tune.first_strike_range && (closing > 4.0 || lined_up || tg.dist < tune.first_strike_range * 0.5))
+                    || (tg.dist <= far && (coming || (lined_up && closing > 4.0))));
             // No laser yet, and one lies within reach: fetch it before picking fights.
             let fetch_first = !f.has(W_LASER)
                 && ((tune.unarmed_strike_range > 0.0 && tg.dist > tune.unarmed_strike_range && self.wanted_laser(f, obs, &sit).is_some())

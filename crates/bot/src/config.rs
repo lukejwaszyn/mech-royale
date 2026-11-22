@@ -70,6 +70,12 @@ tuning! {
     /// attacked before it opens fire (0 = off), while our HP fraction is at least `first_strike_hp`.
     first_strike_range = 130.0,
     first_strike_hp = 0.5,
+    /// ... and out to this distance (capped at what we can see) a mech that has been
+    /// coming straight at us for `first_strike_far_s` seconds, or that comes with its
+    /// guns on us (0 = off). At equal walking speed the first contact is the longest
+    /// range the fight will ever have: a hunter walking in is a target that needs no lead.
+    first_strike_far = 190.0,
+    first_strike_far_s = 1.5,
     /// Having opened fire on a mech we stay on it at least this long (s).
     hunt_commit_s = 6.0,
 
