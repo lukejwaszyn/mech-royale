@@ -280,6 +280,16 @@ pub struct Diag {
     /// First contacts closer than 60 m by what we were doing: fight, loot, hold, other.
     pub contact_close: [f32; 4],
     contacted: Vec<i64>,
+    /// The state at the last decision (at death, when the match ends with it): mechs
+    /// attacking us, of those within 60 m, the nearest attacker's distance, known mechs
+    /// within 150 m, the target's distance and whether it was in the line of fire, our
+    /// HP then and 5 / 10 / 20 s earlier (percent of max), energy, weapons (bits: 2
+    /// mortar, 4 laser, 8 lightning), mode (0 final .. 5 hold), in the zone.
+    pub end: [f32; 14],
+    /// Match time of our first eight kills.
+    pub kill_t: [f32; 8],
+    hp_hist: std::collections::VecDeque<(f32, f32)>,
+    kills_seen: usize,
 }
 
 impl Diag {
@@ -345,6 +355,28 @@ impl Diag {
             ("contact60_loot", self.contact_close[1]),
             ("contact60_hold", self.contact_close[2]),
             ("contact60_other", self.contact_close[3]),
+            ("end_engaged", self.end[0]),
+            ("end_engaged60", self.end[1]),
+            ("end_att_dist", self.end[2]),
+            ("end_foes150", self.end[3]),
+            ("end_tgt_dist", self.end[4]),
+            ("end_tgt_los", self.end[5]),
+            ("end_hp", self.end[6]),
+            ("end_hp5", self.end[7]),
+            ("end_hp10", self.end[8]),
+            ("end_hp20", self.end[9]),
+            ("end_energy", self.end[10]),
+            ("end_weapons", self.end[11]),
+            ("end_mode", self.end[12]),
+            ("end_in_zone", self.end[13]),
+            ("kill_t1", self.kill_t[0]),
+            ("kill_t2", self.kill_t[1]),
+            ("kill_t3", self.kill_t[2]),
+            ("kill_t4", self.kill_t[3]),
+            ("kill_t5", self.kill_t[4]),
+            ("kill_t6", self.kill_t[5]),
+            ("kill_t7", self.kill_t[6]),
+            ("kill_t8", self.kill_t[7]),
         ]
     }
 }
@@ -697,7 +729,45 @@ impl Bot {
         let cubes_known = self.model.cubes.len() as f32;
         let cube_near = self.model.cubes.iter().map(|c| dist2d(c.pos, f.pos)).fold(f32::INFINITY, f32::min);
         let max_cubes = self.tune.max_cubes;
+        let kills_now = self.model.kills as usize;
         let d = &mut self.diag;
+        // the state at this decision (the last one is the state at death)
+        let pct = 100.0 / obs.me.max_hp.max(1.0);
+        d.hp_hist.push_back((f.t, obs.me.hp * pct));
+        while d.hp_hist.front().map_or(false, |x| f.t - x.0 > 21.0) {
+            d.hp_hist.pop_front();
+        }
+        let hp_ago = |h: &std::collections::VecDeque<(f32, f32)>, s: f32| h.iter().find(|x| f.t - x.0 <= s).map_or(0.0, |x| x.1);
+        let att: Vec<&Foe> = sit.foes.iter().filter(|x| x.engaged).collect();
+        d.end = [
+            att.len() as f32,
+            att.iter().filter(|x| x.dist < 60.0).count() as f32,
+            att.iter().map(|x| x.dist).fold(f32::INFINITY, f32::min).min(999.0),
+            sit.foes.iter().filter(|x| x.age < 3.0 && x.dist < 150.0).count() as f32,
+            sit.target.map_or(0.0, |x| x.dist),
+            sit.target.map_or(0.0, |x| x.los as u8 as f32),
+            obs.me.hp * pct,
+            hp_ago(&d.hp_hist, 5.0),
+            hp_ago(&d.hp_hist, 10.0),
+            hp_ago(&d.hp_hist, 20.0),
+            obs.me.energy,
+            f.slots.iter().flatten().filter(|s| s.bit != W_GUN).fold(0u8, |a, s| a | s.bit) as f32,
+            match intent.mode {
+                Mode::Final => 0.0,
+                Mode::Zone => 1.0,
+                Mode::Retreat => 2.0,
+                Mode::Fight => 3.0,
+                Mode::Loot => 4.0,
+                Mode::Hold => 5.0,
+            },
+            obs.me.in_zone as u8 as f32,
+        ];
+        while d.kills_seen < kills_now {
+            if d.kills_seen < 8 {
+                d.kill_t[d.kills_seen] = f.t;
+            }
+            d.kills_seen += 1;
+        }
         d.cubes = obs.me.cubes;
         d.cubes_left = cubes_known;
         if cubes_known > 0.0 && obs.me.cubes < max_cubes {
