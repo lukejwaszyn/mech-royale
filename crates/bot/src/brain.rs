@@ -1489,7 +1489,7 @@ impl Bot {
 
     /// Something worth walking to while we fight `tg`: the laser we lack, a cube, a
     /// weapon for an empty slot - if the way there does not lead towards any enemy.
-    fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<V3> {
+    fn fight_errand(&self, f: &Frame, obs: &Obs, sit: &Sit, tg: &Foe, rmin: f32) -> Option<(V3, bool)> {
         let reach = self.tune.errand_range;
         if reach <= 0.0 {
             return None;
@@ -1515,13 +1515,13 @@ impl Bot {
                 dist2d(x.pos, p) >= keep
             })
         };
-        let mut best: Option<(f32, V3)> = None;
-        let mut offer = |value: f32, p: V3, limit: f32, prize: bool| {
+        let mut best: Option<(f32, V3, bool)> = None;
+        let mut offer = |value: f32, p: V3, limit: f32, prize: bool, pile: bool| {
             let d = dist2d(p, f.pos);
             if d <= limit && ok(p, prize) {
                 let score = value / (d + 12.0);
                 if best.map_or(true, |b| score > b.0) {
-                    best = Some((score, p));
+                    best = Some((score, p, pile));
                 }
             }
         };
@@ -1532,17 +1532,19 @@ impl Bot {
             }
             let bit = weapon_bit(&p.kind);
             if bit == W_LASER && !f.has(W_LASER) {
-                offer(self.tune.w_laser, p.pos, reach, true);
+                offer(self.tune.w_laser, p.pos, reach, true, false);
             } else if empty && !f.has(bit) && bit != 0 {
-                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3, false);
+                offer(self.weapon_value(bit, sit), p.pos, reach * 0.3, false, false);
             }
         }
         if obs.me.cubes < self.tune.max_cubes {
             for c in &self.model.cubes {
-                offer(self.tune.v_cube, c.pos, reach * self.tune.errand_cube_frac, false);
+                let n = self.pile_at(c.pos, room);
+                let far = 1.0 + (self.tune.errand_pile * (n - 1.0)).clamp(0.0, 1.0);
+                offer(self.tune.v_cube * self.cube_gain(obs.me.cubes, n), c.pos, reach * self.tune.errand_cube_frac * far, false, n >= 2.0);
             }
         }
-        best.map(|b| b.1)
+        best.map(|b| (b.1, b.2))
     }
 
     fn plan_fight(&mut self, f: &Frame, obs: &Obs, sit: &Sit, tg: Foe) -> Intent {
@@ -1565,12 +1567,12 @@ impl Bot {
             it.boost = hurry && d.remaining > 8.0;
             return it;
         }
-        if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
+        if let Some((g, pile)) = self.fight_errand(f, obs, sit, &tg, rmin) {
             self.fight_kind = 2;
             let d = self.drive_to_item(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
-            it.boost = hurry && d.remaining > 8.0;
+            it.boost = (hurry || (pile && me.energy > 40.0)) && d.remaining > 8.0;
             return it;
         }
 
@@ -1671,6 +1673,9 @@ impl Bot {
             // Close in on where it is until we have a line of fire.
             let d = self.drive_to(f, obs, tg.pos, (rmin * 0.6).max(8.0), false);
             let mut it = Intent::new(Mode::Fight, d, 1.6);
+            // A dead mech's pile (its cubes plus two) is worth a longer dash than one
+            // cube: each is +4% HP and damage, and the fight has to move somewhere.
+            let room = (self.tune.max_cubes - obs.me.cubes).max(1.0);
             if tg.engaged || sit.n_engaged > 0 {
                 it.strafe = Some((side, 0.4 * sw));
             }

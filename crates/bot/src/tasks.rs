@@ -88,6 +88,22 @@ impl Bot {
         self.eval_task_in(f, obs, sit, pos, value, extra_s, self.tune.loot_range, self.tune.avoid_range * 0.9, STAND_ANY)
     }
 
+    /// How many cubes lie together at `pos` (a dead mech's pile is one trip), at most
+    /// the `room` we have left below the cap.
+    pub(crate) fn pile_at(&self, pos: V3, room: f32) -> f32 {
+        if self.tune.cube_pile <= 0.0 {
+            return 1.0;
+        }
+        (self.model.cubes.iter().filter(|o| dist2d(o.pos, pos) < 8.0 && (o.pos[2] - pos[2]).abs() < 4.0).count() as f32).min(room).max(1.0)
+    }
+
+    /// Worth of gaining `n` cubes when we hold `have`, in cubes: `n`, plus a bonus when
+    /// that reaches the next entry of `cubes.upgrade_thresholds` (an upgrade on top).
+    pub(crate) fn cube_gain(&self, have: f32, n: f32) -> f32 {
+        let next = self.cfg.cubes.upgrade_thresholds.iter().copied().find(|th| *th > have + 0.5);
+        n + if next.map_or(false, |th| have + n >= th - 0.01) { self.tune.cube_upgrade_bonus } else { 0.0 }
+    }
+
     /// How close we must be able to stand to a weapon pickup / a cube to get it:
     /// (horizontal distance from the nearest place to stand, height difference).
     /// `take` works within `loot.pickup_radius` and 4 m of height (protocol 6), cubes
@@ -219,7 +235,7 @@ impl Bot {
             // keep-away distance of our goal must not send us back and forth).
             let current = self.task.map_or(false, |c| c.kind == kind);
             let r = if r.is_none() && current {
-                let prize = matches!(kind, TaskKind::Pickup(id) if self.model.pickups.iter().any(|p| p.id == id && p.kind == "laser"));
+                let prize = matches!(kind, TaskKind::Pickup(id) if self.model.pickups.iter().any(|p| p.id == id && p.kind == "laser")) || matches!(kind, TaskKind::Cube(_));
                 let (range, keep) = if prize { (tune.laser_range, tune.laser_keep) } else { (tune.loot_range, tune.avoid_range * 0.9) };
                 let stand = match kind {
                     TaskKind::Pickup(_) => self.stand_pickup(),
@@ -252,31 +268,44 @@ impl Bot {
             }
         }
         if want_cubes {
+            // Each cube is +4% HP (healed at once) and damage; every cube of a pile is
+            // offered at the pile's worth, so a dead mech's five cubes are not priced
+            // like one cube - and a pile of three or more is worth the longer, bolder
+            // trip we make for a laser.
+            let room = (tune.max_cubes - me.cubes).max(1.0);
             for c in &self.model.cubes {
-                offer(TaskKind::Cube(c.id), c.pos, self.eval_task_in(f, obs, sit, c.pos, tune.v_cube, 0.0, tune.loot_range, tune.cube_keep, self.stand_cube()));
+                let n = self.pile_at(c.pos, room);
+                let (range, keep) = if n >= 3.0 { (tune.laser_range, tune.laser_keep.min(tune.cube_keep)) } else { (tune.loot_range, tune.cube_keep) };
+                offer(TaskKind::Cube(c.id), c.pos, self.eval_task_in(f, obs, sit, c.pos, tune.v_cube * self.cube_gain(me.cubes, n), 0.0, range, keep, self.stand_cube()));
             }
         }
+        let up = |n: f32| tune.v_cube * (self.cube_gain(me.cubes, n) - n);
         // No laser and none known: looking for one may be worth more than farming.
         let searching = !f.has(W_LASER) && !self.model.pickups.iter().any(|p| p.kind == "laser");
         let farm_mult = if searching { tune.nolaser_farm_mult } else { 1.0 };
         if farm_ok {
             let special_full = f.slots.iter().all(|s| s.is_some());
             for c in &self.model.crates {
-                let v = farm_mult * tune.v_crate * if want_cubes { 1.0 } else if special_full { 0.0 } else { 0.5 };
+                // one cube, and half the time a weapon: a laser one time in three of those
+                let weapon = if f.has(W_LASER) { 0.0 } else { tune.v_crate_laser };
+                let v = farm_mult * if want_cubes { tune.v_crate + up(self.cfg.crates.cubes) + weapon } else if special_full { 0.0 } else { 0.5 * tune.v_crate + weapon };
                 offer(TaskKind::Crate(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, v, c.hp / gun_dps + 2.0));
             }
             if want_cubes {
                 for tr in self.model.tracks.iter().filter(|x| x.npc && t - x.seen_t < 4.0) {
-                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, farm_mult * tune.v_npc, tr.hp / gun_dps + 3.0));
+                    offer(TaskKind::Npc(tr.id), tr.pos, self.eval_task(f, obs, sit, tr.pos, farm_mult * (tune.v_npc + up(self.cfg.npc.cubes)), tr.hp / gun_dps + 3.0));
                 }
             }
         }
         for d in &obs.drops {
             let travel = dist2d(d.pos, f.pos) * 1.3 / me.stats.walk_speed.max(1.0);
             let contested = sit.foes.iter().any(|x| x.age < 5.0 && dist2d(x.pos, d.pos) < 60.0);
-            let v = tune.v_drop * (1.0 + (1.0 - f.hp_frac)) * if contested { 0.3 } else { 1.0 };
+            let v = (tune.v_drop * (1.0 + (1.0 - f.hp_frac)) + if want_cubes { up(self.cfg.drops.cubes) } else { 0.0 }) * if contested { 0.3 } else { 1.0 };
             let wait = (d.lands_in - travel).max(0.0) + d.capture_s;
-            offer(TaskKind::Drop(d.id), d.pos, self.eval_task(f, obs, sit, d.pos, v, wait));
+            // (Its own reach: announced 25 s before it lands and never withdrawn, it is
+            // worth a longer walk than the cube next door - the general 170 m cap used
+            // to hide most drops from the value formula altogether.)
+            offer(TaskKind::Drop(d.id), d.pos, self.eval_task_in(f, obs, sit, d.pos, v, wait, tune.drop_range.max(tune.loot_range), tune.avoid_range * 0.9, STAND_ANY));
         }
         if best.map(|b| b.kind) != self.task.map(|b| b.kind) {
             self.task_started = t;
