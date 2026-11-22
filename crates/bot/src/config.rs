@@ -215,6 +215,9 @@ tuning! {
     errand_clear = 40.0,
     /// Target choice: extra weight for a mech that carries a laser.
     laser_carrier_bonus = 1.0,
+    /// ... and, while we hold a laser, for one that carries a mortar (cook-off: our
+    /// laser hits it 60% harder).
+    cookoff_bonus = 0.6,
     /// While we hold no laser at all: start no fight with a mech further away than this
     /// (0 = no such limit). A gun duel takes twice as long and draws others in.
     no_laser_strike_range = 0.0,

@@ -977,6 +977,10 @@ impl Bot {
             if foe.weapons & W_LASER != 0 {
                 s += if f.has(W_LASER) { tune.laser_carrier_bonus * 0.4 } else { tune.laser_carrier_bonus };
             }
+            // Our laser sets off a carried mortar: such a mech dies a third sooner.
+            if foe.weapons & W_MORTAR != 0 && f.has(W_LASER) {
+                s += tune.cookoff_bonus;
+            }
             if best.map_or(true, |(bs, _)| s > bs) {
                 best = Some((s, *foe));
             }
@@ -1036,11 +1040,7 @@ impl Bot {
                 && ((weak && f.hp_frac >= tune.retreat_hp + 0.1) || (stronger && tg.los && f.hp_frac >= tune.hunt_min_hp && !tune.ffa));
             // A kill within reach is a place gained whatever else is going on: a mech in
             // plain sight that a few more hits will finish.
-            let burst = f.slots.iter().flatten().map(|s| match s.bit {
-                W_LASER if s.cooldown < 1.0 => s.stats.damage,
-                W_GUN => s.stats.damage * s.ammo.min(4.0),
-                _ => 0.0,
-            }).sum::<f32>() * f.dmg_scale;
+            let burst = self.burst_vs(f, tg.weapons);
             let kill_shot = tune.kill_shot_range > 0.0 && tg.los && tg.dist <= tune.kill_shot_range && (tg.hp <= burst || tg.hp_frac < tune.finish_hp * 0.6);
             // In the practice run every other mech is one squad that hunts us: one that
             // walks up to us or lines us up is coming to shoot. Shoot first.
