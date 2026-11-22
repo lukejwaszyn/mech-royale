@@ -370,3 +370,76 @@ fn walks_into_the_zone_past_a_lightning_carrier() {
     assert!(east(never) < 0.5, "without the rule the arc holds the bot back (the test bites)");
     assert!(east(Tuning::default()) > 0.5, "walking east into the circle");
 }
+
+/// A weapon we cannot stand next to is not a task: one lying 6 m overhead (a ledge with
+/// no room to stand, its nearest nav node the ground below) is out of `take`'s 4 m of
+/// height. The bot used to walk under it and stand there, 40 s at a time, in every fight.
+#[test]
+fn ignores_a_weapon_it_cannot_stand_next_to() {
+    let walk = |z: f32| -> (bool, f64) {
+        let mut s = session(Tuning::default());
+        let laser = json!([{"id": 8001, "kind": "laser", "pos": [HERE[0] + 60.0, HERE[1], z]}]);
+        let mut a = Value::Null;
+        for k in 0..6 {
+            a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+        }
+        (s.bot.as_ref().unwrap().mode == bot::brain::Mode::Loot, a["move"][0].as_f64().unwrap())
+    };
+    let (loot, mx) = walk(0.0);
+    assert!(loot && mx > 0.8, "a laser on the ground is fetched (loot={loot}, move x={mx})");
+    let (loot, _) = walk(6.5);
+    assert!(!loot, "a laser 6.5 m overhead is not");
+}
+
+/// Standing next to the thing we came for without getting it: after a few seconds it is
+/// given up (nothing may hold the bot on one spot), tried once more a minute later, and
+/// then left for good.
+#[test]
+fn gives_up_a_pickup_it_stands_next_to_and_cannot_take() {
+    let mut s = session(Tuning::default());
+    // as if a wall held us 5 m short of it: the observations never show us any closer
+    let laser = json!([{"id": 8001, "kind": "laser", "pos": [HERE[0] + 5.0, HERE[1], 0.0]}]);
+    let bad = |s: &Session| s.bot.as_ref().unwrap().model.bad_pickups.contains(&8001);
+    let mut k = 0;
+    let mut gave_up_at = None;
+    while k < 100 && gave_up_at.is_none() {
+        let a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+        assert!(a.get("take").is_none(), "out of reach: {a}");
+        if k < 5 {
+            assert!(a["move"][0].as_f64().unwrap() > 0.2, "walks at it: {a}");
+        }
+        if bad(&s) {
+            gave_up_at = Some(k);
+        }
+        k += 1;
+    }
+    let at = gave_up_at.expect("given up within ten seconds");
+    assert!((30..=60).contains(&at), "after about four seconds (decision {at})");
+    let a = step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(s.bot.as_ref().unwrap().mode != bot::brain::Mode::Loot, "and not walked at any more: {a}");
+    // a minute later it gets a second chance ...
+    let later = k + 620;
+    step(&mut s, &obs(later, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(!bad(&s), "second chance after a minute");
+    // ... and when that fails too it is left for good
+    for j in 1..80 {
+        step(&mut s, &obs(later + j, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    }
+    assert!(bad(&s));
+    step(&mut s, &obs(later + 1500, HERE, [0.0, 0.0], json!([gun(), null]), json!({"pickups": laser})));
+    assert!(bad(&s), "no third chance");
+}
+
+/// The same for a cube: it is forgotten and not believed again while given up.
+#[test]
+fn gives_up_a_cube_it_cannot_collect() {
+    let mut s = session(Tuning::default());
+    let cube = json!([{"id": 5009, "pos": [HERE[0] + 6.0, HERE[1], 0.0]}]);
+    for k in 0..60 {
+        step(&mut s, &obs(k, HERE, [0.0, 0.0], json!([gun(), null]), json!({"cubes": cube})));
+    }
+    let bot = s.bot.as_ref().unwrap();
+    assert!(bot.model.cubes.is_empty() && bot.model.bad_cubes.contains(&5009), "the cube is given up");
+    let a = step(&mut s, &obs(60, HERE, [0.0, 0.0], json!([gun(), null]), json!({"cubes": cube})));
+    assert!(s.bot.as_ref().unwrap().model.cubes.is_empty(), "and stays forgotten: {a}");
+}

@@ -397,6 +397,12 @@ pub struct Bot {
     pub(crate) task_black: Vec<(crate::tasks::TaskKind, f32)>,
     pub(crate) take_t: f32,
     pub(crate) take_tries: (i64, u32),
+    /// Where the legs are being sent this decision, when it is a thing to pick up.
+    pub(crate) leg_goal: Option<V3>,
+    /// The thing we stand next to without getting it (id, seconds), and the things given
+    /// up that way: (id, try again at, times).
+    pub(crate) stall: (i64, f32),
+    pub(crate) gave_up: Vec<(i64, f32, u32)>,
     // gunnery (gunnery.rs)
     pub(crate) last_aim: V2,
     pub(crate) scan_base: f32,
@@ -522,6 +528,9 @@ impl Bot {
             task_black: Vec::new(),
             take_t: -1e9,
             take_tries: (-1, 0),
+            leg_goal: None,
+            stall: (-1, 0.0),
+            gave_up: Vec::new(),
             last_aim: [0.0, 0.0],
             scan_base: 0.0,
             mortar_aim_until: -1e9,
@@ -610,7 +619,7 @@ impl Bot {
         self.mode = intent.mode;
         let (mv, boost, jump) = self.steer(&f, obs, &sit, &intent);
         let (aim, fire, reload) = self.gunnery(&f, obs, &sit, &intent, mv);
-        let (take, drop) = self.loot_actions(&f, obs, &sit);
+        let (take, drop) = self.loot_actions(&f, obs, &sit, &intent);
         let pick = self.pick_upgrade(&f, obs);
         self.last_aim = aim;
         self.note_diag(&f, obs, &sit, &intent, mv, fire, reload, boost);
@@ -1148,7 +1157,33 @@ impl Bot {
         self.mover.drive(nav, &obs.me, goal, arrive_r, f.t, &f.jet, climb, f.can_plan())
     }
 
+    /// Walk to a thing that is picked up by standing next to it (a weapon, a cube).
+    /// Close by, with a clear straight walk, the legs head for the thing itself (or a
+    /// spot just short of it) instead of the nav node nearest to it: a node's centre can
+    /// be further from the thing than the pickup radius, and the bot then stood at the
+    /// end of its path with the thing just out of reach.
+    pub(crate) fn drive_to_item(&mut self, f: &Frame, obs: &Obs, goal: V3, arrive_r: f32, climb: bool) -> Drive {
+        self.leg_goal = Some(goal);
+        let d = dist2d(goal, f.pos);
+        if d < 9.0 && (goal[2] - f.pos[2]).abs() < 3.0 && obs.me.grounded && !self.mover.hopping() {
+            let dir = norm2([goal[0] - f.xy[0], goal[1] - f.xy[1]]);
+            for short in [0.0f32, 2.5] {
+                let left = d - short;
+                if left <= 0.05 {
+                    return Drive { arrived: true, remaining: 0.0, ..Default::default() };
+                }
+                let to = [f.xy[0] + dir[0] * left, f.xy[1] + dir[1] * left];
+                if self.world.walk_clear(f.pos, to, &f.slim, 3.0).is_some() {
+                    self.mover.clear_path();
+                    return Drive { dir, arrived: left < arrive_r, remaining: left, ..Default::default() };
+                }
+            }
+        }
+        self.drive_to(f, obs, goal, arrive_r, climb)
+    }
+
     fn plan_move(&mut self, f: &Frame, obs: &Obs, sit: &Sit) -> Intent {
+        self.leg_goal = None;
         let me = &obs.me;
         let z = f.zone;
         let home = self.home.unwrap_or(f.pos);
@@ -1211,11 +1246,11 @@ impl Bot {
         //     get out of their sight and let whoever hunts us come round the corner alone.
         if sit.wary && need == 0 {
             if let Some((g, climb)) = self.laser_run(f, obs, sit) {
-                let d = self.drive_to(f, obs, g, 0.4, climb);
+                let d = self.drive_to_item(f, obs, g, 0.4, climb);
                 return Intent::new(Mode::Loot, d, 2.0);
             }
             if let Some(g) = self.quick_grab(f, obs, sit, 70.0, 55.0) {
-                let d = self.drive_to(f, obs, g, 0.4, false);
+                let d = self.drive_to_item(f, obs, g, 0.4, false);
                 return Intent::new(Mode::Loot, d, 2.0);
             }
             let near = sit.foes.iter().filter(|x| x.age < 10.0).min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)).copied();
@@ -1524,7 +1559,7 @@ impl Bot {
         let hurry = self.tune.errand_boost > 0.0 && tg.los && tg.dist < self.tune.errand_boost && me.energy > 12.0;
         if let Some((g, climb)) = self.laser_run(f, obs, sit) {
             self.fight_kind = 1;
-            let d = self.drive_to(f, obs, g, 0.4, climb);
+            let d = self.drive_to_item(f, obs, g, 0.4, climb);
             let mut it = Intent::new(Mode::Fight, d, 1.9);
             it.strafe = Some((side, 0.45 * sw));
             it.boost = hurry && d.remaining > 8.0;
@@ -1532,7 +1567,7 @@ impl Bot {
         }
         if let Some(g) = self.fight_errand(f, obs, sit, &tg, rmin) {
             self.fight_kind = 2;
-            let d = self.drive_to(f, obs, g, 0.4, false);
+            let d = self.drive_to_item(f, obs, g, 0.4, false);
             let mut it = Intent::new(Mode::Fight, d, 1.7);
             it.strafe = Some((side, 0.5 * sw));
             it.boost = hurry && d.remaining > 8.0;
