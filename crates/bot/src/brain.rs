@@ -421,6 +421,9 @@ pub struct Bot {
     kite_boost: bool,
     /// Diagnostics: which branch of `plan_fight` moved the legs.
     fight_kind: u8,
+    /// Diagnostics of the last steering decision (MECH_VERBOSE): lightning arcs avoided,
+    /// other mechs avoided, hard drive, drive direction.
+    steer_dbg: (usize, usize, bool, V2),
     prev_mode: Mode,
     last_t: f32,
     last_mode_log: f32,
@@ -543,6 +546,7 @@ impl Bot {
             boosting: false,
             kite_boost: false,
             fight_kind: 0,
+            steer_dbg: (0, 0, false, [0.0, 0.0]),
             prev_mode: Mode::Hold,
             last_t: 0.0,
             last_mode_log: -1e9,
@@ -657,10 +661,11 @@ impl Bot {
             let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
             let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
             crate::vlogln!(
-                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} task={}",
+                "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} steer(arcs={} others={} hard={} dir={:.1},{:.1} wait={} hop={} rec={} g={}) task={}",
                 obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
                 obs.me.in_zone, need_dbg, f.zone.r - (f.xy[0] - f.zone.c[0]).hypot(f.xy[1] - f.zone.c[1]), f.zone.nr - (f.xy[0] - f.zone.nc[0]).hypot(f.xy[1] - f.zone.nc[1]), f.zone.t1,
                 sit.n_engaged, self.model.dmg_recent, tg, w.join(" "), intent.drive.remaining,
+                self.steer_dbg.0, self.steer_dbg.1, self.steer_dbg.2, self.steer_dbg.3[0], self.steer_dbg.3[1], intent.drive.waiting, self.mover.hopping(), self.mover.recovering(obs.t), obs.me.grounded,
                 self.task.map(|k| format!("{:?}@({:.0},{:.0},{:.0}) s={:.2}", k.kind, k.pos[0], k.pos[1], k.pos[2], k.score)).unwrap_or_default()
             );
         }
@@ -1918,6 +1923,7 @@ impl Bot {
         let me = &obs.me;
         let t = f.t;
         let d = intent.drive;
+        self.steer_dbg = (0, 0, d.hard, d.dir);
         if d.hard {
             // hop or recovery: exact control
             let _ = self.mover.unstick(me, [0.0, 0.0], true, t, f.dt, self.tune.stuck_time_s, &mut self.rng);
@@ -1966,8 +1972,15 @@ impl Bot {
         // us from walking in. (Sixteen mechs converging on a small circle with a few
         // lightning carriers inside it had the bot stand still at the rim, every step
         // inwards costing more than standing, until the zone killed it.)
+        // "About to pass" counts the walk still ahead of us: with 60 m of path left, six
+        // seconds before the rim arrives is too late. (In a crowded free-for-all the bot
+        // side-stepped in front of a neutral lightning carrier for 30 s, 60 m from
+        // safety, started walking at the six-second mark and died outside the circle.)
+        let zone_walk = matches!(intent.mode, Mode::Zone) && !d.arrived;
+        let walk_s = d.remaining / me.stats.walk_speed.max(1.0);
+        let force = self.tune.zone_force_s;
         let zone_urgent = matches!(intent.mode, Mode::Final)
-            || (matches!(intent.mode, Mode::Zone) && (!me.in_zone || f.zone.leaves_at(f.xy, 5.0).map_or(false, |tl| tl - t < self.tune.zone_force_s)));
+            || (matches!(intent.mode, Mode::Zone) && (!me.in_zone || (force >= 0.0 && f.zone.leaves_at(f.xy, 5.0).map_or(false, |tl| tl - t < force + 1.2 * walk_s))));
         if zone_urgent {
             arcs.clear();
         }
@@ -1980,6 +1993,7 @@ impl Bot {
             }
         }
         let under_fire = sit.n_engaged > 0 || self.model.dmg_recent > 40.0;
+        self.steer_dbg = (arcs.len(), others.len(), false, d.dir);
         let plain = intent.strafe.is_none() && intent.away.is_none() && !has_threats && arcs.is_empty();
         let mut cmd = d.dir;
         if !plain && me.grounded {
@@ -2009,6 +2023,9 @@ impl Bot {
                     // so rather step out of our own line of fire than hold it standing)
                     s -= if zone_urgent && !d.arrived {
                         6.0
+                    } else if zone_walk {
+                        // on the way into the circle: go round an arc, do not wait in front of it
+                        1.5
                     } else if under_fire && intent.strafe.is_some() {
                         self.tune.stand_penalty
                     } else if intent.strafe.is_some() || intent.away.is_some() {
@@ -2056,7 +2073,8 @@ impl Bot {
                     // distance to the carrier one second from now if we walk this way
                     let q = [f.xy[0] + c[0] * speed, f.xy[1] + c[1] * speed];
                     let d = (q[0] - p[0]).hypot(q[1] - p[1]);
-                    let safe = arc_r + 15.0;
+                    // (walking into the circle only the arc itself is kept clear of)
+                    let safe = arc_r + if zone_walk { 4.0 } else { 15.0 };
                     if d < safe {
                         s -= self.tune.arc_avoid * (safe - d) / 15.0;
                     }

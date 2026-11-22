@@ -367,8 +367,8 @@ fn walks_into_the_zone_past_a_lightning_carrier() {
     };
     let mut never = Tuning::default();
     never.zone_force_s = -1.0;
-    assert!(east(never) < 0.5, "without the rule the arc holds the bot back (the test bites)");
-    assert!(east(Tuning::default()) > 0.5, "walking east into the circle");
+    assert!(east(never) < 0.95, "without the rule the arc bends the walk (the test bites)");
+    assert!(east(Tuning::default()) > 0.97, "walking straight east into the circle");
 }
 
 /// A weapon we cannot stand next to is not a task: one lying 6 m overhead (a ledge with
@@ -515,4 +515,32 @@ fn far_first_strike_needs_a_mech_that_keeps_coming() {
     let mut ffa = Tuning::default();
     ffa.apply_ffa();
     assert_eq!(run(ffa, [-11.0, 0.0, 0.0], 3.14), None, "free-for-all: never");
+}
+
+/// The same with the circle still a dozen seconds away but 70 m of walking ahead: the
+/// walk has to start now, arc or no arc. (The six-second rule alone let the bot wait in
+/// front of a neutral lightning carrier until it was too late to walk in.)
+#[test]
+fn starts_the_walk_into_the_zone_in_time_past_a_lightning_carrier() {
+    let east = |tune: Tuning| -> f64 {
+        let mut s = session(tune);
+        // the rim reaches us at t = 27.7 s; it is t = 15 s and safety is 70 m to the east
+        let zone = json!({"center": [100.0, 0.0], "radius": 135.0, "next_center": [100.0, 0.0], "next_radius": 70.0, "shrink_start": 0.0, "shrink_end": 120.0, "dps": 100.0});
+        let pos = [-20.0, 0.0, 0.0];
+        let foe = json!([mech(7, [25.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.5, 0.0], json!(["gun", "lightning"]))]);
+        let mut a = json!(null);
+        for k in 150..154 {
+            let mut o: Value = serde_json::from_str(&obs(k, pos, [0.0, 0.0], json!([gun(), laser()]), json!({"mechs": foe}))).unwrap();
+            let r = 135.0 - 65.0 * (k as f64 * 0.1) / 120.0;
+            o["zone"] = zone.clone();
+            o["zone"]["radius"] = json!(r);
+            a = step(&mut s, &o.to_string());
+        }
+        assert_eq!(format!("{:?}", s.bot.as_ref().unwrap().mode), "Zone");
+        a["move"][0].as_f64().unwrap()
+    };
+    let mut never = Tuning::default();
+    never.zone_force_s = -1.0;
+    assert!(east(never) < 0.95, "without the rule the arc bends the walk (the test bites)");
+    assert!(east(Tuning::default()) > 0.97, "walking straight east into the circle while there is time for the walk");
 }
