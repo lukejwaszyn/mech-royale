@@ -116,6 +116,9 @@ pub struct Frame {
     pub zone: Zone,
     pub jet: JetParams,
     pub started: Instant,
+    /// False when the bot is driven without a deadline (the local simulator's
+    /// in-process mode): decisions then never depend on how long they took.
+    pub clocked: bool,
 }
 
 impl Frame {
@@ -131,7 +134,7 @@ impl Frame {
     }
     /// Is there time for another expensive query (path, cover search)?
     pub fn can_plan(&self) -> bool {
-        self.spent_ms() < 12.0
+        !self.clocked || self.spent_ms() < 12.0
     }
 }
 
@@ -419,6 +422,10 @@ pub struct Bot {
     pub debug: bool,
     pub verbose: bool,
     verbose_every: i64,
+    /// Ignore the wall clock when deciding (no "is there time left to plan?" checks).
+    /// For the local simulator's in-process mode, where nothing enforces a deadline and
+    /// a busy machine must not change the match; never set by the real protocol loop.
+    pub no_clock: bool,
 }
 
 impl Bot {
@@ -427,10 +434,25 @@ impl Bot {
     pub fn new(hello: &Hello, tune: Tuning) -> Bot {
         let started = Instant::now();
         let cfg = &hello.config;
-        let (world, map_ok) = match World::load(std::path::Path::new(&hello.map.dir)) {
-            Ok(w) => (w, true),
-            Err(e) => {
-                eprintln!("[bot] map load failed ({e}); playing on a flat world");
+        // The directory hello names; if that is missing or unreadable, the place the
+        // rulebook says the map is mounted in a match; only then the flat stand-in.
+        let mut loaded = None;
+        for dir in [hello.map.dir.as_str(), "/arena"] {
+            if dir.is_empty() {
+                continue;
+            }
+            match World::load(std::path::Path::new(dir)) {
+                Ok(w) => {
+                    loaded = Some(w);
+                    break;
+                }
+                Err(e) => crate::logln!("[bot] map load from '{dir}' failed ({e})"),
+            }
+        }
+        let (world, map_ok) = match loaded {
+            Some(w) => (w, true),
+            None => {
+                crate::logln!("[bot] no map; playing on a flat world");
                 (flat_world(cfg), false)
             }
         };
@@ -448,7 +470,7 @@ impl Bot {
             );
             navs.push((cubes, nav));
         }
-        eprintln!("[bot] slot {} map_ok={} navs={} init {:.0} ms ffa={}", hello.slot, map_ok, navs.len(), started.elapsed().as_secs_f32() * 1000.0, tune.ffa);
+        crate::logln!("[bot] slot {} map_ok={} navs={} init {:.0} ms ffa={}", hello.slot, map_ok, navs.len(), started.elapsed().as_secs_f32() * 1000.0, tune.ffa);
         Bot::with_parts(hello, tune, world, navs, map_ok)
     }
 
@@ -518,6 +540,7 @@ impl Bot {
             verbose_every: std::env::var("MECH_VERBOSE").ok().and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 1).unwrap_or(5),
             verbose: std::env::var("MECH_VERBOSE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
             debug: std::env::var("MECH_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            no_clock: false,
         }
     }
 
@@ -571,6 +594,7 @@ impl Bot {
             zone: Zone::from_obs(&obs.zone, obs.t),
             jet: JetParams { jump_speed: st.jump_speed, jet_accel: st.jet_accel, max_rise_speed: st.max_rise_speed, gravity: st.gravity, jet_drain: st.jet_drain },
             started,
+            clocked: !self.no_clock,
         }
     }
 
@@ -601,7 +625,7 @@ impl Bot {
         if self.verbose && !f.has(W_LASER) && (obs.t * 10.0).round() as i64 % 20 == 0 {
             let why = self.explain_laser(&f, obs, &sit);
             if !why.is_empty() {
-                eprintln!("[laser] t={:.0} {:?} task={:?}{}", obs.t, intent.mode, self.task.map(|k| k.kind), why);
+                crate::vlogln!("[laser] t={:.0} {:?} task={:?}{}", obs.t, intent.mode, self.task.map(|k| k.kind), why);
             }
         }
         let need_dbg = if self.verbose { self.zone_need(&f, obs) } else { 0 };
@@ -615,12 +639,12 @@ impl Bot {
         }
         if ms > 20.0 {
             tm.over_20 += 1;
-            eprintln!("[bot] slow decision {:.1} ms at t={:.1} mode={:?}", ms, obs.t, self.mode);
+            crate::logln!("[bot] slow decision {:.1} ms at t={:.1} mode={:?}", ms, obs.t, self.mode);
         }
         if self.verbose && (obs.t * 10.0).round() as i64 % self.verbose_every == 0 {
             let tg = sit.target.map(|x| format!("tgt {} d={:.0} los={} hp={:.0} eng={} w={}", x.id, x.dist, x.los, x.hp, x.engaged, x.weapons)).unwrap_or_default();
             let w: Vec<String> = f.slots.iter().flatten().map(|s| format!("{}:{:.0}/{:.1}/{:.1}", s.bit, s.ammo, s.reload, s.cooldown)).collect();
-            eprintln!(
+            crate::vlogln!(
                 "[v] t={:.1} {:?} hp={:.0} e={:.0} pos=({:.0},{:.0},{:.0}) v={:.1} mv=({:.1},{:.1}) b={} fire={:?} rl={} zone(in={} need={} edge={:.0} next={:.0} t1={:.0}) n={} dmg={:.0} {} [{}] rem={:.0} task={}",
                 obs.t, intent.mode, obs.me.hp, obs.me.energy, f.pos[0], f.pos[1], f.pos[2], f.vel[0].hypot(f.vel[1]), act.mv[0], act.mv[1], act.boost, act.fire, act.reload,
                 obs.me.in_zone, need_dbg, f.zone.r - (f.xy[0] - f.zone.c[0]).hypot(f.xy[1] - f.zone.c[1]), f.zone.nr - (f.xy[0] - f.zone.nc[0]).hypot(f.xy[1] - f.zone.nc[1]), f.zone.t1,
@@ -632,9 +656,9 @@ impl Bot {
             self.last_mode_log = obs.t;
             if self.verbose {
                 let cs: Vec<String> = self.model.cubes.iter().map(|c| format!("{}:d{:.0}/dz{:.0}/age{:.0}{}", c.id, dist2d(c.pos, f.pos), c.pos[2] - f.pos[2], obs.t - c.seen_t, if f.zone.inside_next([c.pos[0], c.pos[1]], 0.0) { "" } else { "/out" })).collect();
-                eprintln!("[cubes] t={:.0} have={} known: {}", obs.t, obs.me.cubes, cs.join(" "));
+                crate::vlogln!("[cubes] t={:.0} have={} known: {}", obs.t, obs.me.cubes, cs.join(" "));
             }
-            eprintln!(
+            crate::logln!(
                 "[bot] t={:.0} {:?} hp={:.0}/{:.0} cubes={} alive={} foes={} engaged={} kills={} avg={:.2}ms max={:.1}ms stuck={}",
                 obs.t, self.mode, obs.me.hp, obs.me.max_hp, obs.me.cubes, obs.alive, sit.foes.len(), sit.n_engaged, self.model.kills,
                 tm.sum_ms / tm.n.max(1) as f32, tm.max_ms, self.mover.stuck_count
@@ -681,7 +705,7 @@ impl Bot {
         if quiet && len2(mv) > 0.5 && len2(self.diag_mv) > 0.5 && dot2(norm2(mv), norm2(self.diag_mv)) < -0.5 {
             d.flips += 1;
             if self.verbose {
-                eprintln!(
+                crate::vlogln!(
                     "[flip] t={:.1} {:?} wary={} fight={} tgt={:?} retreat={} task={:?} explore={:?} need={} rem={:.0} recovering={}",
                     f.t, intent.mode, sit.wary, sit.fight, sit.target.map(|x| (x.id, x.dist as i32, x.los)), self.retreating, self.task.map(|k| k.kind), self.explore.map(|e| (e.0[0] as i32, e.0[1] as i32)),
                     need, intent.drive.remaining, recovering
@@ -1722,7 +1746,7 @@ impl Bot {
         let t = f.t;
         let d = intent.drive;
         if d.hard {
-            // hop or wait for energy: exact control
+            // hop or recovery: exact control
             let _ = self.mover.unstick(me, [0.0, 0.0], true, t, f.dt, self.tune.stuck_time_s, &mut self.rng);
             return (d.dir, d.jet, d.jump);
         }
@@ -1897,7 +1921,8 @@ impl Bot {
         } else if me.energy >= self.tune.boost_travel_start.min(me.max_energy - 1.0) && d.remaining > 60.0 && !sit.threat_near {
             self.boosting = true;
         }
-        let boost = me.grounded && len2(cmd) > 0.3 && (intent.boost || self.boosting || (arc_close && me.energy > 4.0));
+        // (Never for convenience while the mover is saving energy for a climb.)
+        let boost = me.grounded && len2(cmd) > 0.3 && (((intent.boost || self.boosting) && !d.waiting) || (arc_close && me.energy > 4.0));
         (cmd, boost, false)
     }
 

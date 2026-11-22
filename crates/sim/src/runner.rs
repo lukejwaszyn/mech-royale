@@ -179,10 +179,13 @@ impl InProc {
         let hello: bot::proto::Hello = serde_json::from_value(hello.clone()).unwrap_or_default();
         let tune = inproc_tuning(over);
         let started = Instant::now();
-        let b = match NAV_POOL.with(|p| p.borrow_mut().pop()) {
+        let mut b = match NAV_POOL.with(|p| p.borrow_mut().pop()) {
             Some((world, navs)) => bot::Bot::with_parts(&hello, tune, world, navs, true),
             None => bot::Bot::new(&hello, tune),
         };
+        // Nothing enforces a deadline here: the bot must not decide differently because
+        // the machine is busy (the same seed has to give the same match).
+        b.no_clock = true;
         let stats = ProtoStats { ready_ms: started.elapsed().as_secs_f64() * 1000.0, ..Default::default() };
         InProc { bot: Some(b), stats, last: Cmd::default() }
     }

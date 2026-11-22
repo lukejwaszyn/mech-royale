@@ -300,7 +300,8 @@ impl Bot {
             }
         }
 
-        aim[1] = aim[1].clamp(st.min_pitch, st.max_pitch);
+        // (Not `clamp`: that panics when the limits arrive the wrong way round.)
+        aim[1] = aim[1].max(st.min_pitch).min(st.max_pitch);
         (aim, fire, reload)
     }
 

@@ -593,3 +593,41 @@ fn query_speed() {
     assert!(geo_us < 2.0 * SLACK, "collision queries too slow: {geo_us} us");
     assert!(see_us < 30.0 * SLACK);
 }
+
+/// Rays and sight tests with absurd numbers come back at once. (A ray of 1e9 m, or an
+/// infinite one, used to march for ever: `t + dt == t` in f32. A yaw of 1e9 never left
+/// the subtract-until-it-fits loop. One such observation hung the bot for the match.)
+#[test]
+fn absurd_rays_and_yaws_terminate() {
+    let w = world();
+    let a = [0.0f32, 0.0, 20.0];
+    let t0 = Instant::now();
+    for far in [1.0e5f32, 1.0e6, 1.6e7, 1.0e9, 1.0e30, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        for b in [[far, 0.0, 20.0], [0.0, far, 5.0], [far, far, far], [3.0, 4.0, far]] {
+            let _ = w.los(a, b);
+            let _ = w.los(b, a);
+            let _ = w.raycast(a, b);
+            let _ = w.raycast(b, a);
+            let _ = w.walk_clear(a, [b[0], b[1]], &Body::default(), 3.0);
+        }
+        assert!(!w.los(a, [far, far, far]) || far.abs() <= 1.0e6, "a ray to nowhere ({far}) is not a line of fire");
+    }
+    let vp = VisionParams::default();
+    for yaw in [1.0e9f32, -1.0e9, 1.0e30, f32::INFINITY, f32::NAN] {
+        let _ = w.can_see([0.0, 0.0, 8.0], yaw, [100.0, 0.0, 0.0], 9.0, &vp);
+    }
+    // a sane yaw beyond one turn still sees what it faces
+    let open = (0..40).map(|i| [-250.0 + 12.0 * i as f32, -40.0, 0.0f32]).find_map(|p| {
+        let z = w.terrain_height(p[0], p[1]);
+        let eye = [p[0], p[1], z + 8.0];
+        let tgt = [p[0] + 60.0, p[1], w.terrain_height(p[0] + 60.0, p[1])];
+        w.can_see(eye, 0.0, tgt, 9.0, &vp).then_some((eye, tgt))
+    });
+    if let Some((eye, tgt)) = open {
+        let turn = 2.0 * std::f32::consts::PI;
+        assert!(w.can_see(eye, 3.0 * turn, tgt, 9.0, &vp), "yaw + 3 turns faces the same way");
+        assert!(w.can_see(eye, -2.0 * turn, tgt, 9.0, &vp));
+        assert!(!w.can_see(eye, std::f32::consts::PI + turn, tgt, 9.0, &vp), "facing away, beyond the near range");
+    }
+    assert!(t0.elapsed().as_secs_f64() < 2.0 * SLACK, "absurd rays took {:?}", t0.elapsed());
+}

@@ -163,6 +163,12 @@ pub struct Terrain {
 
 const TILE: usize = 8;
 
+/// Both ends of a ray are finite numbers within a sane distance of the map.
+#[inline]
+fn ray_finite(a: [f32; 3], b: [f32; 3]) -> bool {
+    a.iter().chain(b.iter()).all(|v| v.is_finite() && v.abs() < 1.0e7)
+}
+
 impl Terrain {
     /// Ground height at (x, y), bilinear; clamped at the grid border.
     #[inline]
@@ -816,6 +822,9 @@ impl World {
         let dx = to[0] - from[0];
         let dy = to[1] - from[1];
         let len = (dx * dx + dy * dy).sqrt();
+        if !len.is_finite() || len > 5000.0 {
+            return None; // not a walk on this map (and the loop below would never end)
+        }
         if len < 1e-4 {
             return Some(cur.z);
         }
@@ -938,6 +947,11 @@ impl World {
 
     fn terrain_ray(&self, a: [f32; 3], b: [f32; 3]) -> Option<f32> {
         let tr = &self.terrain;
+        // Garbage in (NaN, infinity) must never hang the march below: `t + dt == t`
+        // for ever once a ray is long enough. Such a ray counts as blocked at once.
+        if !ray_finite(a, b) {
+            return Some(0.0);
+        }
         if a[2].min(b[2]) > tr.max_h {
             return None;
         }
@@ -950,10 +964,18 @@ impl World {
             let g = tr.height(a[0], a[1]);
             return if b[2] < g { Some(((a[2] - g) / (a[2] - b[2])).clamp(0.0, 1.0)) } else { None };
         }
-        let dt1 = (tr.step / lh).min(1.0);
-        let dt8 = (TILE as f32 * tr.step) / lh;
+        // (A step is never smaller than what still moves `t` in f32, and the march is
+        // bounded: the map is about a kilometre across, a ray a hundred times that is
+        // not a question about the map.)
+        let dt1 = (tr.step / lh).min(1.0).max(4.0e-7);
+        let dt8 = ((TILE as f32 * tr.step) / lh).max(dt1);
         let mut t = 0.0f32;
+        let mut steps = 0u32;
         while t < 1.0 {
+            steps += 1;
+            if steps > 200_000 {
+                return Some(t);
+            }
             let x = a[0] + d[0] * t;
             let y = a[1] + d[1] * t;
             let z = a[2] + d[2] * t;
@@ -1012,6 +1034,9 @@ impl World {
     /// First thing a shot (gun bullet, laser, mortar segment) from `a` to `b` hits:
     /// prisms (buildings, stadium, bridges) and terrain. Trees never stop shots.
     pub fn raycast(&self, a: [f32; 3], b: [f32; 3]) -> Option<Hit> {
+        if !ray_finite(a, b) {
+            return Some(Hit { t: 0.0, pos: a, kind: HitKind::Terrain });
+        }
         let ph = self.prisms_ray(a, b, false);
         let th = self.terrain_ray(a, b);
         let (t, kind) = match (ph, th) {
@@ -1033,7 +1058,7 @@ impl World {
     /// line of fire test; trees are ignored.
     #[inline]
     pub fn los(&self, a: [f32; 3], b: [f32; 3]) -> bool {
-        self.prisms_ray(a, b, true).is_none() && self.terrain_ray(a, b).is_none()
+        ray_finite(a, b) && self.prisms_ray(a, b, true).is_none() && self.terrain_ray(a, b).is_none()
     }
 
     /// Foliage on the sight line a→b: `(trunk_hit, crown_metres)`.
@@ -1134,14 +1159,13 @@ impl World {
         let near = dist <= vp.near_range;
         let mut far = false;
         if !near && dist <= vp.range {
-            let mut da = dy.atan2(dx) - eye_yaw;
-            while da > std::f32::consts::PI {
-                da -= 2.0 * std::f32::consts::PI;
+            // (No subtract-until-it-fits loop: for a yaw of 1e9 that never ends.)
+            let two_pi = 2.0 * std::f32::consts::PI;
+            let mut da = (dy.atan2(dx) - eye_yaw).rem_euclid(two_pi);
+            if da > std::f32::consts::PI {
+                da -= two_pi;
             }
-            while da < -std::f32::consts::PI {
-                da += 2.0 * std::f32::consts::PI;
-            }
-            far = da.abs() <= vp.fov_deg.to_radians() * 0.5;
+            far = da.is_finite() && da.abs() <= vp.fov_deg.to_radians() * 0.5;
         }
         if !near && !far {
             return false;

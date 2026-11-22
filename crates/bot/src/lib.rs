@@ -4,6 +4,7 @@ pub mod ballistics;
 pub mod brain;
 pub mod config;
 pub mod gunnery;
+pub mod log;
 pub mod mathx;
 pub mod model;
 pub mod mover;
