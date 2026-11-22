@@ -285,7 +285,10 @@ impl Model {
             }
             let height = if npc { cfg.npc.height } else { cfg.mech.height * (1.0 + cfg.cubes.size_per_cube * a.cubes) };
             let mid = [a.pos[0], a.pos[1], a.pos[2] + height * 0.5];
-            let top = [a.pos[0], a.pos[1], a.pos[2] + height * 0.9];
+            // (The same two points the guns aim at: a sliver of its head above a wall
+            // that no weapon of ours is aimed at is not a line of fire. Counting it had
+            // the bot stand and stare at a mech it never shot for 50 seconds.)
+            let top = [a.pos[0], a.pos[1], a.pos[2] + height * 0.85];
             let los = world.los(muzzle, mid) || world.los(muzzle, top);
             // "Seen" by the protocol's rules (range, view wedge, canopy), not just a clear line.
             let eye_los = world.can_see(eye, me.aim[0], a.pos, height, &vp);

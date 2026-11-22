@@ -223,12 +223,16 @@ impl Bot {
             if let Some((i, s)) = f.slot(W_LASER) {
                 let full = s.stats.charge.max(0.05);
                 let latency = 0.06;
-                let p = add(centre, mul(tg.vel, latency));
+                // the middle, or the head when only that shows above cover (as the gun does)
+                let lead = mul(tg.vel, latency);
+                let mid = add(centre, lead);
+                let head = add([tg.feet[0], tg.feet[1], tg.feet[2] + tg.height * 0.85], lead);
+                let (p, half) = if world.los(shooter, mid) || !world.los(shooter, head) { (mid, tg.height * 0.5) } else { (head, tg.height * 0.15) };
                 let la = aim_at(shooter, p);
                 let d = dist(p, shooter);
                 let in_range = d <= s.stats.range - 2.0;
                 let clear = tg.live && world.los(shooter, p);
-                let tol = aim_tolerance(tg.radius, tg.height * 0.5, d, tune.aim_tol_scale);
+                let tol = aim_tolerance(tg.radius, half, d, tune.aim_tol_scale);
                 let on = aim_settled(me.aim, la, tol, st.turn_rate, st.pitch_rate, 0.03);
                 let charging = s.charge > 0.0;
                 let ready = s.cooldown <= 0.12;
@@ -285,8 +289,11 @@ impl Bot {
             if s.reload <= 0.0 && s.ammo < s.stats.mag {
                 let fresh_foe = sit.foes.iter().any(|x| x.age < 3.0 && (x.los || x.dist < 150.0));
                 let quiet = self.model.quiet_for() > 2.5;
-                // with an enemy about, only top up a nearly empty magazine while it cannot see us
-                let top_up = !gun_busy && fresh_foe && s.ammo <= s.stats.mag * 0.25 && !sit.foes.iter().any(|x| x.los);
+                // with an enemy about, only top up while it cannot see us: a nearly empty
+                // magazine at once, a half empty one after a quiet moment (the bot used to
+                // sit behind a corner for a minute with four rounds in the gun)
+                let hidden = !sit.foes.iter().any(|x| x.los);
+                let top_up = !gun_busy && fresh_foe && hidden && (s.ammo <= s.stats.mag * 0.25 || (s.ammo <= s.stats.mag * 0.5 && self.model.quiet_for() > 1.5));
                 if s.ammo <= 0.0 || top_up || (!gun_busy && !fresh_foe && (s.ammo <= s.stats.mag * 0.5 || quiet)) {
                     reload = true;
                 }

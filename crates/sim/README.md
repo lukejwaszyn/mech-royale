@@ -101,7 +101,10 @@ Per match, for the focus bot: who damaged it and by how much (`(H)` = a squad hu
 it died), by which weapon, its gun hits / shots, the number of hunters at the end, and -
 for an in-process bot - the bot's own counters (`bot::brain::Diag`: seconds per mode,
 leg reversals while nobody was shooting, idle seconds, zone damage, seconds with 1 / 2 / 3+
-attackers, seconds without a second weapon and with a laser, ...). The summary adds the
+attackers, seconds without a second weapon and with a laser, damage from mechs that were
+out of view and from mechs other than the target, damage and target time by distance,
+what the legs did while the target was closer than 60 m, first contacts by distance,
+failed roof hops, cubes left lying, ...). The summary adds the
 means per match: damage dealt per weapon, damage taken per opponent level and per weapon,
 who killed it, gun accuracy, seconds spent rubbing walls. Two examples of what this found:
 half of all damage came from "easy" bots because the bot let them walk up to 70 m, and a
@@ -190,10 +193,15 @@ is silent or ambiguous.
 * Slopes: on terrain a step that rises more than `tan(max_slope_deg)` times its length
   is refused (checked every 0.5 m at most); the mech then keeps only one axis of the
   move. Guess: prism tops are exempt, and a mech in the air lands on a hillside that
-  rises up to 1.5 m into its path.
+  rises up to 1.5 m into its path. A rising body moves up before it moves sideways in a
+  tick, so a jump taken while walking uphill leaves the ground (it used not to: the
+  sideways part met the rising terrain first and counted as a landing, and every roof
+  hop that started on rising ground failed).
 * Undersides over any part of the body stop a rise; roof edges catch a body that still
-  overhangs them. In both cases the body is slid away 0.6 m per tick unless a wall
-  holds it or (guess) it is walking toward the roof.
+  overhangs them. From under an eave the body is slid out 0.6 m per tick unless a wall
+  holds it, whatever the legs do (protocol §7; the simulator used to let a mech that
+  walked towards the building stay stuck under it). Off a roof edge it is slid unless a
+  wall holds it or it is walking toward the roof.
 * Overlapping mechs are pushed apart by half the overlap each.
 
 **Weapons and damage** (`src/sim.rs`)
@@ -274,7 +282,8 @@ is silent or ambiguous.
 `cargo test -p sim` (about 20 s, most of it waiting on deliberately broken shell bots):
 
 * `tests/physics.rs` — acceleration, boost, walls and sliding, map edge, step-up,
-  slopes, jump apex, jet climb, bridges and overhangs, roof landing and edges.
+  slopes, jump apex, jet climb, jumping while walking uphill, bridges and overhangs,
+  the slide out from under an eave, roof landing and edges.
 * `tests/rules.rs` — gun travel time, damage and rear armor, walls stopping shots,
   fire rate and reload, mortar arc, splash and concussion, laser charge, cook-off and
   auto-fire, lightning chain and short, zone schedule and damage, regeneration, cubes

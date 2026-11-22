@@ -219,7 +219,7 @@ impl Bot {
         }
         if want_cubes {
             for c in &self.model.cubes {
-                offer(TaskKind::Cube(c.id), c.pos, self.eval_task(f, obs, sit, c.pos, tune.v_cube, 0.0));
+                offer(TaskKind::Cube(c.id), c.pos, self.eval_task_in(f, obs, sit, c.pos, tune.v_cube, 0.0, tune.loot_range, tune.cube_keep));
             }
         }
         // No laser and none known: looking for one may be worth more than farming.

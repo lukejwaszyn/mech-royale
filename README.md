@@ -150,6 +150,26 @@ visible bullets take 0.6 s to arrive. An enemy that closes in is kited: the legs
 while the torso keeps firing. Kiting never walks into a wall [`wall_penalty`], out of the
 zone, or towards other mechs [`crowd_avoid`, +0.2].
 
+**Run from a close enemy** [+0.3]. Under 60 m everything hits, whoever aims: two fifths
+of all damage taken in the simulator came from there. Both sides walk at the same speed,
+so only the boost opens the distance: inside `kite_boost_dist` (90 m) the bot kites on
+boost while there is energy (`kite_boost_start`). An errand under the guns of a target
+that close (the laser, a cube) is run, not walked (`errand_boost`).
+
+**Face what is shooting** (robustness; small in the simulator, fatal when it happens). A
+`damaged` event names its author and gives the bearing of the shot even when the server
+does not list that mech to us. The bot used to keep its guns on its target and its back
+to such an attacker until it died, every hit a rear hit (x1.5). Now the torso turns to
+the bearing once the unseen mech's recent damage reaches `blind_turn_dmg` (unless the
+target in front dies to what is already loaded), and a mech that comes into view already
+shooting is an attacker from its first frame.
+
+**Keep the line of fire** (robustness). While jinking or kiting, a step to where the
+target is hidden costs `los_keep`. Without it the bot stepped behind a corner or back
+from a roof edge, walked out again for the shot, and repeated that for a minute at a
+time, the laser held at half speed and firing itself into the wall. Under fire, standing
+still costs more than that (`stand_penalty`): rather out of the line than standing in it.
+
 **Stay out of lightning arcs** [+0.25]. Lightning never misses inside 45 m and does 240
 damage per second. Every known carrier is a repulsor in the steering, in every mode, and
 inside arc range + 8 m the bot boosts away.
@@ -182,8 +202,17 @@ past buildings and tree trunks) is forgotten after 0.6 s and not believed again 
 **Zone.** A walking-distance field to the inside of the next circle is rebuilt each phase.
 We leave when the closing edge would reach our position within a margin plus the detour
 the buildings force, and once on the way in we keep going until properly inside, fight or
-no fight. In the last phase the circle closes to nothing: the bot goes to the centre and
-stays there.
+no fight. Inside the next circle there is nothing to do, at any depth (a ring a few
+metres inside the rim used to ask for a walk further in while the rim itself did not, and
+a bot idling there paced across that line). In the last phase the circle closes to
+nothing: the bot goes to the centre and stays there. In the simulator the rim is the
+safer place to fight (the squad gathers inside): a pull towards the centre while kiting
+cost up to 0.8 points and was removed.
+
+**Roofs.** A hop that does not arrive (the jump never leaves the ground, the jet is
+stopped) is counted against its access point; after two failures that access is not used
+again in the match, and loot on a roof with no access left is ignored. Before, the bot
+jumped at one wall for a minute and a half, one loot item after the other.
 
 **Free-for-all (`MECH_MODE=ffa`).** For the final against other teams' bots: never starts
 a fight with a healthy mech, only finishes weak ones; retreats to cover when hurt or
@@ -200,7 +229,10 @@ Verified here:
 * behaviour tests (`crates/bot/tests/behaviour.rs`): one small synthetic situation per bug
   the simulator exposed — loot memory and ghosts, destroyed drones, shooting back at
   drones, the loot rule at the next circle's edge, the laser while kiting, lightning arcs,
-  first strike only in practice mode, kill shots, no running from a single attacker;
+  first strike only in practice mode, kill shots, no running from a single attacker,
+  turning to an attacker out of view, idling at the rim of the next circle, strafing
+  that keeps the line of fire (on a small map with one building), and giving up a roof
+  access after failed hops (unit test in `mover.rs`);
 * `check.py` on the native binary and on the amd64 image in the match sandbox.
 
 Closed-loop numbers, all from `crates/sim` (see its README; they do not predict the
@@ -210,11 +242,32 @@ run):
 | | mean of 16 − place |
 |---|---|
 | bot as first written, against the simulated squad | 2.4 |
-| this version, against the simulated squad (1500 matches) | 4.4 |
-| this version, starting with a laser (the ceiling of "get a laser sooner") | 5.4 |
-| this version, 15 scripted bots each for itself | 13.1 |
+| after the first integration round, against the simulated squad (seeds 1000-1599) | 4.4 |
+| this version, same seeds (600 matches) | 4.85 |
+| this version on fresh seeds 7000-7999 (1000 matches); the round-two rules switched off: 4.25 | 4.66 |
+| this version, 15 scripted bots each for itself (300 matches; ffa preset: 13.4) | 13.7 |
+
+One standard error is about 0.11 at 600 matches and 0.085 at 1000, so differences below
+0.2 between two runs mean nothing. (The simulator's own rules changed in round two - jumps
+on rising ground, the slide out from under an eave - which is why the last rows compare
+on the same simulator.) The real binary over pipes, 32 matches against the squad: no
+late answer, slowest answer 13 ms; four 16-way matches of the real binary in ffa mode:
+no late answer, none over 20 ms, no crash.
 
 Open problems, largest first:
+
+* **A third of first contacts happen inside 60 m**, and two fifths of all damage is
+  taken there: a second mech arrives unnoticed while the guns are on the first (1.1 per
+  match), or comes round a corner while the bot loots (0.6) or hides (0.6). Backing
+  away from every near mech (`crowd_repel`), backing away from a hidden target
+  (`blind_kite_dist`) and zig-zag kiting all measured as noise or worse; the knobs are
+  there, off.
+* **Half the cubes stay on the ground.** At death the bot knows of 8 cubes lying about
+  and holds 5; they lie where mechs died, 30-120 m away on the enemy's side. Fetching
+  them under fire (`errand_keep`, `errand_cube_frac`, `cube_keep`, `cube_pull`) cost as
+  much as it gained in the simulator. Ten cubes would be +40% HP and damage and four
+  upgrades, so this is the largest untapped reserve if the real squad shoots worse at
+  close range than the scripted one.
 
 * **No laser in 28% of matches** (15% never see one, 13% see one and do not reach it);
   those matches average 2.0 points. Looking for one deliberately, and killing laser
@@ -225,7 +278,14 @@ Open problems, largest first:
 * **Lightning in our own hands** is worth nothing as played (rushing costs as much as it
   gains), so it is valued low. A corner ambush would be the way to use it.
 * The free-for-all preset cannot be judged here: the scripted free-for-all is far too
-  bloody, and sixteen copies of this bot mostly stand apart until the last circle.
+  bloody, and sixteen copies of this bot stand apart, several without a single cube,
+  until the last circle, where the order of death is the order of HP. In four 16-way
+  matches of the real binary two mechs still died to the zone outside the 25 m circle
+  (crowded out or caught in a fight at its rim; not investigated).
+* **Timing spike.** The walking-distance field of a new zone phase costs about 12 ms
+  once per phase (seven times per match). On a slow or loaded host that one decision can
+  pass the bot's own 30 ms deadline and go out as a coasting answer - never late, but a
+  wasted tick. Building the field on a helper thread would remove it.
 * The final centre is taken as the nearest walkable ground; a roof over the centre is not
   used.
 
